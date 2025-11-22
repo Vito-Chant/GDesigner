@@ -24,7 +24,9 @@ class AdverarialAgent(Node):
  
         system_prompt = f"{self.constraint}" if self.role == "Normal" else "You are a liar who only tells lies."
         # system_prompt = f"{self.constraint}" if self.role == "Normal" else "You are a gibbering idiot"
-        user_prompt = f"The task is: {raw_inputs['task']}\n" if self.role == 'Normal' else self.prompt_set.get_adversarial_answer_prompt(raw_inputs['task'])
+        # user_prompt = "Answer the following instruction using 2000 words or less:"
+        user_prompt = ""
+        user_prompt += f"The task is: {raw_inputs['task']}\n" if self.role == 'Normal' else self.prompt_set.get_adversarial_answer_prompt(raw_inputs['task'])
         if self.role == 'Fake':
             return system_prompt, user_prompt
         spatial_str = ""
@@ -35,6 +37,9 @@ class AdverarialAgent(Node):
             temporal_str += f"Agent {id}, output is:\n\n {info['output']}\n\n"
         user_prompt += f"At the same time, the outputs of other agents are as follows:\n\n{spatial_str} \n\n" if len(spatial_str) else ""
         user_prompt += f"In the last round of dialogue, the outputs of other agents were: \n\n{temporal_str}" if len(temporal_str) else ""
+
+        # user_prompt+="\nConstraint: Answer strictly in 2000 words."
+        user_prompt+="\nConstraint: Answer using 2000 words or less."
         return system_prompt, user_prompt
                 
     def _execute(self, input:Dict[str,str],  spatial_info:Dict[str,Dict], temporal_info:Dict[str,Dict],**kwargs):

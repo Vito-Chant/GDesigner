@@ -4,6 +4,7 @@ from abc import ABC
 import numpy as np
 import torch
 import asyncio
+import weave
 
 from GDesigner.graph.node import Node
 from GDesigner.agents.agent_registry import AgentRegistry
@@ -309,7 +310,8 @@ class Graph(ABC):
             
         return final_answers, log_probs
 
-    async def arun(self, input: Dict[str,str], 
+    @weave.op()
+    async def arun(self, input: Dict[str,str],
                   num_rounds:int = 3, 
                   max_tries: int = 3, 
                   max_time: int = 600,) -> List[Any]:

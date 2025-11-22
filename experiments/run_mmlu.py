@@ -6,6 +6,7 @@ import asyncio
 from typing import Union, Literal, List
 import argparse
 import random
+import weave
 
 from GDesigner.graph.graph import Graph
 from datasets.mmlu_dataset import MMLUDataset
@@ -57,7 +58,10 @@ def parse_args():
 
 async def main():
     args = parse_args()
-    
+    weave.init(
+        project_name='vito_chan/G-Designer',
+    )
+
     mode = args.mode
     decision_method = args.decision_method
     agent_names = [name for name,num in zip(args.agent_names,args.agent_nums) for _ in range(num)]

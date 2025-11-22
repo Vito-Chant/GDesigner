@@ -1,6 +1,8 @@
 import sys
 import random
 from typing import Union, Literal, List
+from transformers import AutoTokenizer
+
 
 class Singleton:
     _instance = None
