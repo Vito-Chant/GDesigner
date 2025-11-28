@@ -1,6 +1,7 @@
 from typing import List, Any, Dict
 import re
 import weave
+import torch
 
 from GDesigner.graph.node import Node
 from GDesigner.agents.agent_registry import AgentRegistry
@@ -15,13 +16,14 @@ def find_strings_between_pluses(text):
 
 @AgentRegistry.register('AnalyzeAgent')
 class AnalyzeAgent(Node):
-    def __init__(self, id: str | None = None, role: str = None, domain: str = "", llm_name: str = "", ):
+    def __init__(self, id: str | None = None, role: str = None, domain: str = "", llm_name: str = "", tokens=None):
         super().__init__(id, "AnalyzeAgent", domain, llm_name)
         self.llm = LLMRegistry.get(llm_name)
         self.prompt_set = PromptSetRegistry.get(domain)
         self.role = self.prompt_set.get_role() if role is None else role
         self.constraint = self.prompt_set.get_analyze_constraint(self.role)
         self.wiki_summary = ""
+        self.tokens = tokens
 
     async def _process_inputs(self, raw_inputs: Dict[str, str], spatial_info: Dict[str, Dict],
                               temporal_info: Dict[str, Dict], **kwargs) -> List[Any]:
@@ -51,7 +53,8 @@ class AnalyzeAgent(Node):
             temporal_str) else ""
 
         # user_prompt+="\nConstraint: Answer strictly in 2000 words."
-        user_prompt+="\nConstraint: Answer using 2000 words or less."
+        # if self.tokens is not None:
+        #     user_prompt += "\nConstraint: Answer using {} words or less.".format(self.tokens)
         return system_prompt, user_prompt
 
     def _execute(self, input: Dict[str, str], spatial_info: Dict[str, Dict], temporal_info: Dict[str, Dict], **kwargs):
@@ -70,6 +73,19 @@ class AnalyzeAgent(Node):
         """ Use the processed input to get the result """
         system_prompt, user_prompt = await self._process_inputs(input, spatial_info, temporal_info)
         message = [{'role': 'system', 'content': system_prompt}, {'role': 'user', 'content': user_prompt}]
+        postfix = None
+        if hasattr(self, 'adapter') and self.adapter is not None:
+            # embedding = await self.llm.aembed(message)
+            embedding = await self.llm.agen(message, return_prompt_embedding=True, max_tokens=1)
+            device = next(self.adapter.parameters()).device
+            emb_tensor = torch.tensor(embedding, dtype=torch.float32, device=device).unsqueeze(0)
+            action_idx, log_prob = self.adapter.sample(emb_tensor)
+            if action_idx.item() == 0:
+                return ""
+            message[1]["content"] = message[1]["content"] + self.adapter.constraint_prompt[action_idx.item()]
+            # postfix = self.adapter.constraint_prompt[action_idx.item()]
+
+        # response = await self.llm.agen(message, postfix=postfix)
         response = await self.llm.agen(message)
         if self.wiki_summary != "":
             response += f"\n\n{self.wiki_summary}"

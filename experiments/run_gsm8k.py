@@ -18,7 +18,7 @@ from GDesigner.graph.graph import Graph
 from GDesigner.tools.reader.readers import JSONLReader
 from GDesigner.utils.globals import Time
 from GDesigner.utils.globals import Cost, PromptTokens, CompletionTokens
-from datasets.gsm8k_dataset import gsm_data_process,gsm_get_predict
+from dataset.gsm8k_dataset import gsm_data_process,gsm_get_predict
 
 def load_result(result_file):
     if not result_file.exists():
@@ -38,7 +38,7 @@ def load_config(config_path):
     
 def parse_args():
     parser = argparse.ArgumentParser(description="GDesigner Experiments on gsm8k")
-    parser.add_argument("--dataset_json", type=str, default="datasets/gsm8k/gsm8k.jsonl")
+    parser.add_argument("--dataset_json", type=str, default="dataset/gsm8k/gsm8k.jsonl")
     parser.add_argument("--result_file", type=str, default=None)
     parser.add_argument("--llm_name", type=str, default="gpt-4o")
     parser.add_argument('--mode', type=str, default='FullConnected',

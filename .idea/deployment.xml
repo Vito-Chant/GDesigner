@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
-  <component name="PublishConfigData" autoUpload="Always" serverName="ct@172.18.166.61:22 password (3)" remoteFilesAllowedToDisappearOnAutoupload="false">
+  <component name="PublishConfigData" autoUpload="Always" serverName="ct@172.18.166.61:22 password (3)" confirmBeforeUploading="false" confirmBeforeDeletion="false">
+    <option name="confirmBeforeDeletion" value="false" />
+    <option name="confirmBeforeUploading" value="false" />
     <serverData>
       <paths name="ct@172.18.166.61:22 password">
         <serverdata>

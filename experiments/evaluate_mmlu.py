@@ -17,6 +17,7 @@ async def evaluate(
         num_rounds:int = 1,
         limit_questions: Optional[int] = None,
         eval_batch_size: int = 4,
+        **kwargs
         ) -> float:
 
     print(f"Evaluating gdesigner on {dataset.__class__.__name__} split {dataset.split}")
@@ -69,6 +70,9 @@ async def evaluate(
         print(f"CompletionTokens {CompletionTokens.instance().value/1000} k")
     accuracy.print()
     print("Done!")
+    if kwargs['wandb_run'] is not None:
+        kwargs['wandb_run'].log({"Ptok": PromptTokens.instance().value/1000})
+        kwargs['wandb_run'].log({"Ctok": CompletionTokens.instance().value/1000})
 
     return accuracy.get()
 

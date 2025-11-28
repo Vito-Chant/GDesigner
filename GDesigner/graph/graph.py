@@ -47,6 +47,7 @@ class Graph(ABC):
                 initial_temporal_probability: float = 0.5,
                 fixed_temporal_masks:List[List[int]] = None,
                 node_kwargs:List[Dict] = None,
+                tokens=None
                 ):
         
         if fixed_spatial_masks is None:

@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 from typing import List, Dict, Union
 import asyncio
+import weave
 from GDesigner.llm.utils import convert_messages_to_dict
 from GDesigner.llm.format import Message
 
@@ -22,6 +23,7 @@ class LLM(ABC):
         self.temperature = temperature
 
     @abstractmethod
+    @weave.op()
     async def agen(self, messages: Union[List[Message], List[Dict[str, str]]], **kwargs) -> str:
         """Asynchronously generate model response (to be implemented by subclasses)
 
@@ -33,6 +35,10 @@ class LLM(ABC):
             Generated response string from the model
         """
         pass
+
+    @weave.op()
+    async def aembed(self, messages: Union[List[Message], List[Dict[str, str]]], **kwargs) -> str:
+        raise "Not implemented"
 
     def gen(self, messages: Union[List[Message], List[Dict[str, str]]], **kwargs) -> str:
         """Synchronously generate model response (wrapped based on the async agen method)
