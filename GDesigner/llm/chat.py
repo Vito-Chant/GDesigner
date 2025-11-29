@@ -269,7 +269,7 @@ class VLLMChat(LLM):
                 model=self.llm_name,
                 prompt=prompt_input,
                 api_key="EMPTY",
-                base_url=VLLM_BASE_URL_CHAT,
+                base_url=VLLM_BASE_URL,
                 temperature=req_temp,
                 max_tokens=req_max_tokens,
                 **api_kwargs
@@ -290,12 +290,18 @@ class VLLMChat(LLM):
         #         **api_kwargs
         #     )
 
+        import random
+        url1 = "http://localhost:8000/v1"
+        url2 = "http://localhost:8001/v1"
+        url = random.choice([url1, url2])
+
         # 3. 发起请求 (使用 VLLM 的地址和空 Key)
         return await _generic_achat(
             model=self.llm_name,
             messages=formatted_msgs,
             api_key="EMPTY",
-            base_url=VLLM_BASE_URL,
+            # base_url=VLLM_BASE_URL,
+            base_url=url,
             temperature=req_temp,
             max_tokens=req_max_tokens,
             **api_kwargs

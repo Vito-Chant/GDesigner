@@ -14,6 +14,12 @@ def find_strings_between_pluses(text):
     return re.findall(r'\@(.*?)\@', text)
 
 
+def extract_content(output: Any) -> str:
+    if isinstance(output, tuple) and len(output) >= 1:
+        return output[0]
+    return output
+
+
 @AgentRegistry.register('AnalyzeAgent')
 class AnalyzeAgent(Node):
     def __init__(self, id: str | None = None, role: str = None, domain: str = "", llm_name: str = "", tokens=None):
@@ -37,15 +43,17 @@ class AnalyzeAgent(Node):
         spatial_str = ""
         temporal_str = ""
         for id, info in spatial_info.items():
+            output_content = extract_content(info['output'])
             if self.role == 'Wiki Searcher' and info['role'] == 'Knowlegable Expert':
-                queries = find_strings_between_pluses(info['output'])
+                queries = find_strings_between_pluses(output_content)
                 wiki = await search_wiki_main(queries)
                 if len(wiki):
                     self.wiki_summary = ".\n".join(wiki)
                     user_prompt += f"The key entities of the problem are explained in Wikipedia as follows:{self.wiki_summary}"
-            spatial_str += f"Agent {id}, role is {info['role']}, output is:\n\n {info['output']}\n\n"
+            spatial_str += f"Agent {id}, role is {info['role']}, output is:\n\n {output_content}\n\n"
         for id, info in temporal_info.items():
-            temporal_str += f"Agent {id}, role is {info['role']}, output is:\n\n {info['output']}\n\n"
+            output_content = extract_content(info['output'])
+            temporal_str += f"Agent {id}, role is {info['role']}, output is:\n\n {output_content}\n\n"
 
         user_prompt += f"At the same time, the outputs of other agents are as follows:\n\n{spatial_str} \n\n" if len(
             spatial_str) else ""
@@ -73,16 +81,22 @@ class AnalyzeAgent(Node):
         """ Use the processed input to get the result """
         system_prompt, user_prompt = await self._process_inputs(input, spatial_info, temporal_info)
         message = [{'role': 'system', 'content': system_prompt}, {'role': 'user', 'content': user_prompt}]
+
+        device = next(self.adapter.parameters()).device if hasattr(self,
+                                                                   'adapter') and self.adapter is not None else 'cpu'
+        current_log_prob = torch.tensor(0.0, device=device, requires_grad=True)
+
         postfix = None
         if hasattr(self, 'adapter') and self.adapter is not None:
             # embedding = await self.llm.aembed(message)
             embedding = await self.llm.agen(message, return_prompt_embedding=True, max_tokens=1)
-            device = next(self.adapter.parameters()).device
             emb_tensor = torch.tensor(embedding, dtype=torch.float32, device=device).unsqueeze(0)
             action_idx, log_prob = self.adapter.sample(emb_tensor)
-            if action_idx.item() == 0:
-                return ""
-            message[1]["content"] = message[1]["content"] + self.adapter.constraint_prompt[action_idx.item()]
+            current_log_prob = log_prob
+            if action_idx.item() != 0:
+                constraint = self.adapter.constraint_prompt[action_idx.item()]
+                if constraint:
+                    message[1]["content"] = message[1]["content"] + constraint
             # postfix = self.adapter.constraint_prompt[action_idx.item()]
 
         # response = await self.llm.agen(message, postfix=postfix)
@@ -90,8 +104,8 @@ class AnalyzeAgent(Node):
         if self.wiki_summary != "":
             response += f"\n\n{self.wiki_summary}"
             self.wiki_summary = ""
-        print(self.agent_name, "|", self.role)
+        # print(self.agent_name, "|", self.role)
         # print(f"################system prompt:{system_prompt}")
         # print(f"################user prompt:{user_prompt}")
         # print(f"################response:{response}")
-        return response
+        return response, current_log_prob, action_idx.item()

@@ -5,7 +5,8 @@ from transformers import AutoConfig  # 新增引入
 
 
 class ActionAdapter(nn.Module):
-    def __init__(self, llm_name=None, input_dim=None, hidden_dim=128, action_dim=5, constraint_prompt=None):
+    def __init__(self, llm_name=None, input_dim=None, hidden_dim=128, action_dim=4, constraint_prompt=None,
+                 temperature=50.0):
         super().__init__()
 
         # 自动获取 input_dim 的逻辑
@@ -22,6 +23,8 @@ class ActionAdapter(nn.Module):
                 raise ValueError("初始化 ActionAdapter 时必须提供 llm_name 或 input_dim 其中之一。")
 
         self.input_dim = input_dim
+        self.action_dim = action_dim
+        self.temperature = temperature
 
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
@@ -40,10 +43,10 @@ class ActionAdapter(nn.Module):
         else:
             self.constraint_prompt = {
                 0: None,
-                1: "",
-                2: "\nConstraint: Answer strictly with the final result only.",
-                3: "\nConstraint: Be concise.",
-                4: "\nConstraint: Think step-by-step and provide detailed reasoning."
+                1: "\nConstraint: Answer strictly with the final result only.",
+                2: "\nConstraint: Be concise.",
+                3: "\nConstraint: Think step-by-step and provide detailed reasoning."
+                # 4: "",
             }
 
     def forward(self, embedding_tensor):
@@ -54,7 +57,8 @@ class ActionAdapter(nn.Module):
 
     def sample(self, embedding_tensor):
         logits = self.forward(embedding_tensor)
-        probs = F.softmax(logits, dim=-1)
+        probs = F.softmax(logits / self.temperature, dim=-1)
         dist = torch.distributions.Categorical(probs)
+        print(probs)
         action = dist.sample()
         return action, dist.log_prob(action)

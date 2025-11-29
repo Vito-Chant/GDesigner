@@ -11,10 +11,12 @@ import weave
 import wandb
 import time
 
-from GDesigner.graph.graph import Graph
+# from GDesigner.graph.graph import Graph
+from GDesigner.graph.graph_m import Graph
 from dataset.mmlu_dataset import MMLUDataset
 from dataset.MMLU.download import download
 from experiments.train_mmlu import train
+from experiments.train_magrpo_mmlu import train
 from experiments.evaluate_mmlu import evaluate
 from GDesigner.utils.const import GDesigner_ROOT
 
@@ -30,8 +32,8 @@ def parse_args():
                         help="Mode of operation. Default is 'FullConnected'.")
     parser.add_argument('--lr', type=float, default=0.1,
                         help="learning rate")
-    parser.add_argument('--batch_size', type=int, default=16,
-                        help="batch size")
+    parser.add_argument('--batch_size', type=int, default=1, help="batch size")
+    parser.add_argument('--eval_batch_size', type=int, default=16, help="batch size")
     parser.add_argument('--agent_names', nargs='+', type=str, default=['AnalyzeAgent'],
                         help='Specify agent names as a list of strings')
     parser.add_argument('--agent_nums', nargs='+', type=int, default=[5],
@@ -67,12 +69,12 @@ async def main():
     weave.init(
         project_name='vito_chan/G-Designer',
     )
-    wandb_run = None
-    # wandb_run = wandb.init(
-    #     project="G-Designer",
-    #     config=args,
-    #     name=time.strftime("%Y-%m-%d_%H-%M-%S")
-    # )
+    # wandb_run = None
+    wandb_run = wandb.init(
+        project="G-Designer",
+        config=args,
+        name=time.strftime("%Y-%m-%d_%H-%M-%S")
+    )
 
     mode = args.mode
     tokens = args.tokens
@@ -93,14 +95,16 @@ async def main():
     dataset_train = MMLUDataset('dev')
     dataset_val = MMLUDataset('val')
 
-    if args.optimized_spatial or args.optimized_temporal:
-        await train(graph=graph, dataset=dataset_train, num_iters=args.num_iterations, num_rounds=args.num_rounds,
-                    lr=args.lr, batch_size=args.batch_size)
+    # if args.optimized_spatial or args.optimized_temporal:
+    #     await train(graph=graph, dataset=dataset_train, num_iters=args.num_iterations, num_rounds=args.num_rounds,
+    #                 lr=args.lr, batch_size=args.batch_size)
+    await train(graph=graph, dataset=dataset_train, num_iters=args.num_iterations, num_rounds=args.num_rounds,
+                lr=args.lr, batch_size=args.batch_size, wandb_run=wandb_run)
 
     score = await evaluate(graph=graph, dataset=dataset_val, num_rounds=args.num_rounds,
-                           limit_questions=limit_questions, eval_batch_size=args.batch_size, wandb_run=wandb_run)
+                           limit_questions=limit_questions, eval_batch_size=args.eval_batch_size, wandb_run=wandb_run)
     print(f"Score: {score}")
-    # wandb_run.log({"accuracy": score})
+    wandb_run.log({"accuracy": score})
 
 
 def get_kwargs(mode: Union[
