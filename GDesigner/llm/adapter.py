@@ -59,6 +59,5 @@ class ActionAdapter(nn.Module):
         logits = self.forward(embedding_tensor)
         probs = F.softmax(logits / self.temperature, dim=-1)
         dist = torch.distributions.Categorical(probs)
-        print(probs)
         action = dist.sample()
         return action, dist.log_prob(action)

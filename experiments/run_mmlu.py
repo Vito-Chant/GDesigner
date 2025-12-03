@@ -66,6 +66,7 @@ def parse_args():
 
 async def main():
     args = parse_args()
+    print(args)
     weave.init(
         project_name='vito_chan/G-Designer',
     )

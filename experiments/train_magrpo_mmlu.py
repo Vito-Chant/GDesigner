@@ -18,10 +18,10 @@ async def train(graph: Graph,
                 dataset,
                 num_iters: int = 100,
                 num_rounds: int = 1,
-                lr: float = 5e-5,  # Typically smaller LR for LLM adapters
+                lr: float = 1e-6,  # Typically smaller LR for LLM adapters
                 batch_size: int = 1,  # Keep small due to num_generations expansion
                 num_generations: int = 8,  # Number of samples per prompt (Group size)
-                efficiency_weight: int = 0.5,
+                efficiency_weight: int = 0.3,
                 wandb_run=None
                 ) -> None:
     def infinite_data_loader() -> Iterator[pd.DataFrame]:
@@ -93,6 +93,8 @@ async def train(graph: Graph,
             rewards = []
             log_probs = []
             idx_sum = []
+            acc_rewards = []
+            eff_rewards = []
 
             for raw_res in raw_results:
                 # Unpack result. 
@@ -111,15 +113,20 @@ async def train(graph: Graph,
                 accuracy = Accuracy()
                 accuracy.update(processed_ans, correct_answer)
                 acc_reward = accuracy.get()  # 1.0 or 0.0 usually
-                eff_reward = efficiency_weight * (max_idx_sum - idx) / max_idx_sum
-                total_reward = acc_reward + eff_reward
+                # acc_reward = 0
+                eff_reward = (max_idx_sum - idx) / max_idx_sum
+                total_reward = acc_reward + efficiency_weight * eff_reward
 
                 rewards.append(total_reward)
+                acc_rewards.append(acc_reward)
+                eff_rewards.append(eff_reward)
                 log_probs.append(lp)
                 idx_sum.append(idx)
 
             # Convert to tensors
             rewards_tensor = torch.tensor(rewards, dtype=torch.float32)
+            acc_rewards_tensor = torch.tensor(acc_rewards, dtype=torch.float32)
+            eff_rewards_tensor = torch.tensor(eff_rewards, dtype=torch.float32)
             # Stack log_probs (ensure they are on the same device)
             if len(log_probs) > 0:
                 # Ensure all log_probs are tensors, handle cases where no action was taken (0.0)
@@ -133,9 +140,34 @@ async def train(graph: Graph,
 
             # 4. Compute GRPO Advantages
             # Baseline is the mean reward of the group
-            baseline = rewards_tensor.mean()
-            advantages = (rewards_tensor.to(log_probs_tensor.device) - baseline.to(log_probs_tensor.device)) / (
-                        rewards_tensor.std() + 1e-8)
+            # std = rewards_tensor.std()
+
+            not_select_flag = (acc_rewards_tensor.max() == acc_rewards_tensor.min()) and (
+                    eff_rewards_tensor.max() == eff_rewards_tensor.min())
+
+            print(
+                f"  > Record Answers: {[dataset.postprocess_answer(r[0]) for r in raw_results]} | Correct: {correct_answer}")
+            print(f"  > idx_sum: {idx_sum}")
+            print(f"  > Select: {not not_select_flag}")
+
+            if wandb_run is not None:
+                # wandb_run.log({"train/sample_idx_sum": sum(idx_sum)})
+                wandb_run.log({"train/acc_reward": sum(acc_rewards) / len(acc_rewards)})
+                wandb_run.log({"train/eff_reward": sum(eff_rewards) / len(eff_rewards)})
+                wandb_run.log({"train/reward": (sum(eff_rewards) + sum(acc_rewards)) / len(eff_rewards)})
+
+            if not_select_flag:
+                wandb_run.log({"train/sample_loss": None})
+                continue
+            acc_rewards_tensor = acc_rewards_tensor.to(log_probs_tensor.device)
+            eff_rewards_tensor = eff_rewards_tensor.to(log_probs_tensor.device)
+            acc_advantages = (acc_rewards_tensor - acc_rewards_tensor.mean()) / (acc_rewards_tensor.std() + 1e-8)
+            eff_advantages = (eff_rewards_tensor - eff_rewards_tensor.mean()) / (eff_rewards_tensor.std() + 1e-8)
+            advantages = acc_advantages + efficiency_weight * eff_advantages
+            # baseline = rewards_tensor.mean()
+            # advantages = (rewards_tensor.to(log_probs_tensor.device) - baseline.to(log_probs_tensor.device)) / (
+            #         std + 1e-8)
+            print(f"  > Advantages: {advantages}")
 
             # 5. Compute Loss
             # Loss = - Advantage * LogProb
@@ -148,13 +180,8 @@ async def train(graph: Graph,
 
             batch_loss += single_sample_loss.item()
 
-            print(f"  > Record Answers: {[dataset.postprocess_answer(r[0]) for r in raw_results]}")
-            print(f"  > Correct: {correct_answer} | Advantages: {advantages}")
-            print(f"  > idx_sum: {sum(idx_sum)}")
-
             if wandb_run is not None:
                 wandb_run.log({"train/sample_loss": single_sample_loss.item()})
-                wandb_run.log({"train/sample_idx_sum": sum(idx_sum)})
 
         # 6. Update Parameters
         torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)

@@ -93,10 +93,11 @@ class AnalyzeAgent(Node):
             emb_tensor = torch.tensor(embedding, dtype=torch.float32, device=device).unsqueeze(0)
             action_idx, log_prob = self.adapter.sample(emb_tensor)
             current_log_prob = log_prob
-            if action_idx.item() != 0:
-                constraint = self.adapter.constraint_prompt[action_idx.item()]
-                if constraint:
-                    message[1]["content"] = message[1]["content"] + constraint
+            if action_idx.item() == 0:
+                return "", current_log_prob, action_idx.item()
+            constraint = self.adapter.constraint_prompt[action_idx.item()]
+            if constraint:
+                message[1]["content"] = message[1]["content"] + constraint
             # postfix = self.adapter.constraint_prompt[action_idx.item()]
 
         # response = await self.llm.agen(message, postfix=postfix)

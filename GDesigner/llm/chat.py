@@ -54,6 +54,8 @@ async def _generic_achat(
         extra_body["return_prompt_embedding"] = True
         max_tokens = 1
 
+    logprobs = kwargs.pop("logprobs", False)
+
     client = AsyncOpenAI(api_key=api_key, base_url=base_url)
 
     try:
@@ -65,6 +67,7 @@ async def _generic_achat(
                 temperature=temperature,
                 max_tokens=max_tokens,
                 extra_body=extra_body,
+                logprobs=logprobs,
                 **kwargs  # 传递其他可能的参数，如 top_p
             )
 
@@ -76,11 +79,16 @@ async def _generic_achat(
             return prompt_embeds
 
         response_message = completion.choices[0].message.content
+        if logprobs:
+            logprobs_data = completion.choices[0].logprobs.content
 
         if isinstance(response_message, str):
             # 简单的 token 统计与计费 (保留原有逻辑)
             prompt_text = "".join([str(m.get('content', '')) for m in messages])
             cost_count(prompt_text, response_message, model)
+
+            if logprobs:
+                return response_message, logprobs_data
 
             return response_message
         else:
@@ -116,6 +124,8 @@ async def _generic_acompletion(
         extra_body["return_prompt_embedding"] = True
         max_tokens = 1
 
+    logprobs = kwargs.pop("logprobs", None)
+
     client = AsyncOpenAI(api_key=api_key, base_url=base_url)
 
     try:
@@ -127,6 +137,7 @@ async def _generic_acompletion(
                 temperature=temperature,
                 max_tokens=max_tokens,
                 extra_body=extra_body,
+                logprobs=logprobs,
                 **kwargs  # 传递其他可能的参数，如 top_p, logprobs 等
             )
 
@@ -137,9 +148,15 @@ async def _generic_acompletion(
         # Completions API 的返回结果在 choices[0].text 中
         response_text = completion.choices[0].text
 
+        if logprobs:
+            logprobs_data = completion.choices[0].logprobs
+
         if isinstance(response_text, str):
             prompt_content = prompt if isinstance(prompt, str) else "\n".join(prompt)
             cost_count(prompt_content, response_text, model)
+
+            if logprobs:
+                return response_text, logprobs_data
 
             return response_text
         else:
@@ -246,6 +263,34 @@ class VLLMChat(LLM):
                 print(f"Error loading tokenizer for {self.llm_name}: {e}")
                 raise e
         return self._tokenizer
+
+    async def acomp(self, messages: Union[List[Message], List[Dict], str], **kwargs) -> str:
+        formatted_msgs = self._preprocess_messages(messages)
+        prompt_input = self.tokenizer.apply_chat_template(
+            formatted_msgs,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+
+        req_temp = kwargs.get('temperature', self.temperature)
+        req_max_tokens = kwargs.get('max_tokens', self.max_tokens)
+
+        api_kwargs = {k: v for k, v in kwargs.items() if k not in ['temperature', 'max_tokens']}
+
+        import random
+        url1 = "http://localhost:8000/v1"
+        url2 = "http://localhost:8001/v1"
+        url = random.choice([url1, url2])
+
+        return await _generic_acompletion(
+            model=self.llm_name,
+            prompt=prompt_input,
+            api_key="EMPTY",
+            base_url=url,
+            temperature=req_temp,
+            max_tokens=req_max_tokens,
+            **api_kwargs
+        )
 
     async def agen(self, messages: Union[List[Message], List[Dict], str], **kwargs) -> str:
         # 1. 预处理消息
