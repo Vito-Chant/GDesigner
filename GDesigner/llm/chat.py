@@ -279,7 +279,7 @@ class VLLMChat(LLM):
 
         import random
         url1 = "http://localhost:8000/v1"
-        url2 = "http://localhost:8001/v1"
+        url2 = "http://localhost:8000/v1"
         url = random.choice([url1, url2])
 
         return await _generic_acompletion(
@@ -337,7 +337,7 @@ class VLLMChat(LLM):
 
         import random
         url1 = "http://localhost:8000/v1"
-        url2 = "http://localhost:8001/v1"
+        url2 = "http://localhost:8000/v1"
         url = random.choice([url1, url2])
 
         # 3. 发起请求 (使用 VLLM 的地址和空 Key)
