@@ -22,12 +22,12 @@ def extract_content(output: Any) -> str:
 @AgentRegistry.register('CoReAnalyzeAgent')
 class AnalyzeAgent(Node):
     """
-    CoRe v4.2 AnalyzeAgent (Optimized)
+    CoRe v4.3 AnalyzeAgent - KV Cache 优化版
 
-    优化点:
-    1. 结构化 Prompt：清晰区分 Task, Context (RAG/Wiki), Peer Outputs, Suggestion。
-    2. 上下文融合：Wiki 知识直接融入 Prompt 上下文，而非生成后追加。
-    3. 逻辑流：Task (定义目标) -> Context (提供支持) -> Suggestion (提供策略) -> Execution (执行指令)。
+    **关键特性**:
+    - _async_execute 返回 (response, messages) 元组
+    - messages 包含完整对话历史（System + User + Assistant）
+    - 为 KV Cache 复用提供物理基础
     """
 
     def __init__(self, id: str | None = None, role: str = None, domain: str = "", llm_name: str = "", tokens=None):
@@ -36,6 +36,7 @@ class AnalyzeAgent(Node):
         self.prompt_set = PromptSetRegistry.get(domain)
         self.role = self.prompt_set.get_role() if role is None else role
         self.constraint = self.prompt_set.get_analyze_constraint(self.role)
+        self.wiki_summary = ""
         self.tokens = tokens
 
     async def _process_inputs(
@@ -46,92 +47,75 @@ class AnalyzeAgent(Node):
             **kwargs
     ) -> Tuple[str, str]:
         """
-        处理输入并构建结构化的 Prompt
+        处理输入并构建完整的 Prompt
+
+        职责：
+        1. 构建基础 system_prompt 和 user_prompt
+        2. 处理 Wiki 搜索（如果角色需要）
+        3. 拼接 RAG Context
+        4. 拼接 Suggestion
+        5. 返回最终的完整 Prompt
+
+        Returns:
+            (system_prompt, user_prompt)
         """
-        # === 1. System Prompt (角色设定与约束) ===
+        # === 1. 基础 Prompt ===
         system_prompt = f"{self.constraint}"
 
-        # === 2. 构建各个 Prompt 板块 ===
-        prompt_sections = []
+        # 基础任务描述
+        if self.role != 'Fake':
+            user_prompt = f"The task is: {raw_inputs['task']}\n"
+        else:
+            user_prompt = self.prompt_set.get_adversarial_answer_prompt(raw_inputs['task'])
 
-        # [Section 1: 核心任务]
-        task_content = raw_inputs.get('task', '')
-        if self.role == 'Fake':
-            task_content = self.prompt_set.get_adversarial_answer_prompt(task_content)
-
-        prompt_sections.append(f"### 1. CORE TASK\n{task_content}")
-
-        # [Section 2: 历史上下文 (RAG)]
-        if 'retrieved_history' in raw_inputs and raw_inputs['retrieved_history']:
-            prompt_sections.append(
-                f"### 2. RELEVANT HISTORY (RAG)\nThe following context is retrieved from previous steps:\n{raw_inputs['retrieved_history']}")
-
-        # [Section 3: 外部知识 (Wiki) & 同伴输出 (Spatial/Temporal)]
-        # 处理 Wiki 搜索 (逻辑保持不变，但结果直接放入 Prompt)
-        wiki_context = ""
-        peer_outputs = []
+        # === 2. 处理空间和时间信息 ===
+        spatial_str = ""
+        temporal_str = ""
 
         for id, info in spatial_info.items():
             output_content = extract_content(info['output'])
 
-            # Wiki 搜索触发逻辑
+            # Wiki搜索特殊处理
             if self.role == 'Wiki Searcher' and info['role'] == 'Knowlegable Expert':
                 queries = find_strings_between_pluses(output_content)
-                wiki_results = await search_wiki_main(queries)
-                if wiki_results:
-                    wiki_text = ".\n".join(wiki_results)
-                    wiki_context = f"**Wikipedia Knowledge**:\n{wiki_text}\n"
+                wiki = await search_wiki_main(queries)
+                if len(wiki):
+                    self.wiki_summary = ".\n".join(wiki)
+                    user_prompt += f"\nThe key entities of the problem are explained in Wikipedia as follows:\n{self.wiki_summary}\n"
 
-            peer_outputs.append(f"- Agent {id} ({info['role']}): {output_content}")
+            spatial_str += f"Agent {id}, role is {info['role']}, output is:\n\n {output_content}\n\n"
 
         for id, info in temporal_info.items():
             output_content = extract_content(info['output'])
-            peer_outputs.append(f"- Agent {id} ({info['role']}): {output_content}")
+            temporal_str += f"Agent {id}, role is {info['role']}, output is:\n\n {output_content}\n\n"
 
-        # 组合 Section 3
-        context_str = ""
-        if wiki_context:
-            context_str += f"{wiki_context}\n"
-        if peer_outputs:
-            context_str += "**Peer Outputs**:\n" + "\n\n".join(peer_outputs)
+        # === 3. 拼接 RAG Context ===
+        if 'retrieved_history' in raw_inputs and raw_inputs['retrieved_history']:
+            rag_context = raw_inputs['retrieved_history']
+            user_prompt += f"""
+=== RELEVANT CONTEXT FROM HISTORY ===
+{rag_context}
+=== END OF CONTEXT ===
 
-        if context_str:
-            prompt_sections.append(f"### 3. CURRENT CONTEXT & PEER INFO\n{context_str}")
+"""
 
-        # [Section 4: 战略建议 (Suggestion/Insight) - 高优先级]
+        # === 4. 拼接 Suggestion ===
         if 'insight' in raw_inputs and raw_inputs['insight']:
-            prompt_sections.append(
-                f"### 4. STRATEGIC SUGGESTION (HIGH PRIORITY)\n{raw_inputs['insight']}\n\n*Please strictly follow the above suggestion during execution.*")
+            suggestion = raw_inputs['insight']
+            user_prompt += f"""
+=== STRATEGIC SUGGESTION (HIGH PRIORITY) ===
+{suggestion}
 
-        # === 3. 组装最终 User Prompt ===
-        # 添加具体的执行指令作为结尾
-        prompt_sections.append(
-            "### 5. EXECUTION INSTRUCTION\nBased on the task, history, and suggestions above, please provide your response.")
+Please consider this guidance when formulating your response.
+=== END OF SUGGESTION ===
 
-        user_prompt = "\n\n".join(prompt_sections)
+"""
 
         return system_prompt, user_prompt
 
     def _execute(self, input: Dict[str, str], spatial_info: Dict[str, Dict], temporal_info: Dict[str, Dict], **kwargs):
-        """
-        同步执行入口
-        注意: 由于 search_wiki_main 是异步的，_process_inputs 必须是 async。
-        如果必须在同步环境调用，这里需要 wrap 一层，或者接受 Wiki 功能在同步模式下不可用。
-        此处为了兼容代码结构，暂且保留，但实际运行中应当主要使用 _async_execute。
-        """
-        # 警告：如果在 Event Loop 中直接调用此同步方法可能会报错，因为 _process_inputs 是 async
-        # 这里假设外部已经处理了 async 环境，或者这只是个 placeholder
-        import asyncio
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
-        system_prompt, user_prompt = loop.run_until_complete(
-            self._process_inputs(input, spatial_info, temporal_info)
-        )
-
+        """同步执行 (保留兼容性)"""
+        system_prompt, user_prompt = self._process_inputs(input, spatial_info, temporal_info)
         message = [{'role': 'system', 'content': system_prompt}, {'role': 'user', 'content': user_prompt}]
         response = self.llm.gen(message)
         return response
@@ -143,21 +127,40 @@ class AnalyzeAgent(Node):
             spatial_info: Dict[str, Dict],
             temporal_info: Dict[str, Dict],
             **kwargs
-    ):
+    ) -> Tuple[str, List[Dict[str, str]]]:
         """
-        异步执行 (v4.2 极简版)
+        异步执行 (v4.3 KV Cache 优化版)
+
+        **关键变更**:
+        返回值从 `str` 改为 `Tuple[str, List[Dict]]`
+
+        Returns:
+            (response, messages) 其中：
+            - response: 生成的文本
+            - messages: 完整对话历史 [System, User, Assistant]
+
+        **KV Cache 基础**:
+        返回的 messages 可被下游直接复用，追加新指令后继续生成
         """
-        # 1. 获取结构化 Prompt (包含 Wiki, RAG, Suggestion 所有信息)
+        # 1. 获取完整 Prompt
         system_prompt, user_prompt = await self._process_inputs(input, spatial_info, temporal_info)
 
-        # 2. 构建消息
-        message = [
+        # 2. 构建消息历史
+        messages = [
             {'role': 'system', 'content': system_prompt},
             {'role': 'user', 'content': user_prompt}
         ]
 
-        # 3. 调用 LLM
-        # Wiki 内容已经在 _process_inputs 中处理并放入 user_prompt，此处无需再追加
-        response = await self.llm.agen(message)
+        # 3. 调用 LLM 生成
+        response = await self.llm.agen(messages)
 
-        return response
+        # 4. 附加 Wiki 摘要（如果有）
+        if self.wiki_summary != "":
+            response += f"\n\n{self.wiki_summary}"
+            self.wiki_summary = ""
+
+        # **5. 关键步骤：将 Assistant 的响应加入历史**
+        messages.append({'role': 'assistant', 'content': response})
+
+        # **6. 返回元组：(文本, 完整历史)**
+        return response, messages

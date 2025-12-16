@@ -1,20 +1,20 @@
 """
-CoRe Framework v4.2: Main Graph Implementation
-完整集成：Retrieve(Reranker) -> Execute -> Store(List) -> Route(LLM)
+CoRe Framework v4.3.1: Main Graph Implementation - 修复路径记录
+完整集成：Retrieve(Reranker) -> Execute -> Store(List) -> Route(LLM with Path Awareness)
 
-v4.2 更新:
-- 适配 Unified Ranker 新签名 (agent_input_context, routing_history)
-- 移除 Confidence 相关逻辑
-- 优化路由决策的上下文传递
+v4.3.1 关键修复:
+- 正确记录冷启动到 routing_history
+- 完整的路径追踪（含推理和建议）
+- 循环检测和警告
 """
 
 import sys
 import os
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+# sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 import asyncio
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass
 from pathlib import Path
 import time
@@ -27,7 +27,7 @@ import weave
 
 @dataclass
 class CoReResult:
-    """CoRe执行结果 (v4.2: 移除confidence相关字段)"""
+    """CoRe执行结果"""
     final_answer: str
     execution_trace: List[Dict]
     routing_decisions: List[Dict]
@@ -35,19 +35,21 @@ class CoReResult:
     total_time: float
     total_cost_tokens: int
     success: bool
+    kv_cache_hits: int
+    loop_detections: int  # **v4.3.1新增**
 
 
 class CoReGraph:
     """
-    Cognitive Relay Graph v4.2 - 主编排器
+    Cognitive Relay Graph v4.3.1 - 主编排器 (修复路径记录)
 
     核心流程：
-    Step 0: 冷启动 (Reranker)
+    Step 0: 冷启动 (Reranker) - **记录到 routing_history**
     循环 (max_routing次):
         Step 1: Retrieve (Reranker) - RAG检索历史
-        Step 2: Execute - Agent执行
-        Step 3: Store - 存储到历史列表
-        Step 4: Post-hoc Route (LLM) - 决策下一棒 + 生成Suggestion
+        Step 2: Execute - Agent执行，返回 (output, messages)
+        Step 3: Store - 存储输出
+        Step 4: Post-hoc Route (LLM) - **使用完整路径历史进行决策**
     """
 
     def __init__(
@@ -59,14 +61,13 @@ class CoReGraph:
             max_routing: int = 10,
             registry_save_path: Optional[Path] = None,
             reranker_model: str = "BAAI/bge-reranker-v2-m3",
-            rag_top_k: int = 3
+            rag_top_k: int = 3,
+            max_loop_count: int = 2  # **v4.3.1新增**
     ):
         """初始化CoRe Graph"""
-
-        # 导入本地模块
-        from mind_registry import MindRegistry, AgentProfile
-        from unified_ranker import UnifiedRanker
-        from belief_evolver import BeliefEvolver, InteractionTrace
+        from GDesigner.CoRe.mind_registry import MindRegistry
+        from GDesigner.CoRe.unified_ranker import UnifiedRanker
+        from GDesigner.CoRe.belief_evolver import BeliefEvolver
 
         self.domain = domain
         self.llm_name = llm_name
@@ -74,40 +75,41 @@ class CoReGraph:
         self.max_routing = max_routing
         self.rag_top_k = rag_top_k
 
-        # 初始化LLM
+        # 初始化组件
         self.llm = LLMRegistry.get(llm_name)
-
-        # 初始化Mind Registry (去中心化互认)
         self.mind_registry = MindRegistry(save_path=registry_save_path)
         self._initialize_agent_profiles()
 
-        # 初始化Unified Ranker (Reranker + LLM)
-        self.unified_ranker = UnifiedRanker(
-            llm=self.llm,
-            reranker_model_name=reranker_model
-        )
-
-        # 初始化Belief Evolver
-        self.belief_evolver = BeliefEvolver(
-            llm=self.llm,
-            mind_registry=self.mind_registry
-        )
-
-        # 初始化Decision Maker
         self.decision_maker = AgentRegistry.get(
             decision_method,
             domain=domain,
             llm_name=llm_name
         )
 
+        # **v4.3.2: 传递 Decision Maker ID 到 Ranker**
+        self.unified_ranker = UnifiedRanker(
+            llm=self.llm,
+            reranker_model_name=reranker_model,
+            max_loop_count=max_loop_count,
+            decision_maker_id=self.decision_maker.id  # **新增参数**
+        )
+
+        self.belief_evolver = BeliefEvolver(
+            llm=self.llm,
+            mind_registry=self.mind_registry
+        )
+
         # 执行状态
-        self.history_trace = []  # List[str] - 纯文本历史
-        self.current_trace = []  # List[Dict] - 详细执行轨迹
+        self.history_trace = []
+        self.current_trace = []
         self.interaction_traces = []
+        self.kv_cache_hits = 0
+        self.loop_detections = 0
+        self.termination_attempts = 0  # **v4.3.2新增**
 
     def _initialize_agent_profiles(self):
-        """从domain初始化Agent profiles，触发互认初始化"""
-        from mind_registry import AgentProfile
+        """从domain初始化Agent profiles"""
+        from GDesigner.CoRe.mind_registry import AgentProfile
         from GDesigner.prompt.prompt_set_registry import PromptSetRegistry
 
         prompt_set = PromptSetRegistry.get(self.domain)
@@ -116,7 +118,6 @@ class CoReGraph:
             try:
                 description = prompt_set.get_description(role)
 
-                # 简化的能力解析
                 capabilities = []
                 if "math" in role.lower():
                     capabilities = ["mathematical reasoning", "problem solving"]
@@ -134,7 +135,6 @@ class CoReGraph:
                     description=description
                 )
 
-                # **关键**: register_agent会自动触发互认初始化
                 self.mind_registry.register_agent(profile)
 
             except Exception as e:
@@ -148,7 +148,7 @@ class CoReGraph:
             training: bool = False
     ) -> CoReResult:
         """
-        主执行循环 - Cognitive Relay (v4.2)
+        主执行循环 - Cognitive Relay (v4.3.2 修复终止逻辑)
         """
 
         start_time = time.time()
@@ -160,13 +160,17 @@ class CoReGraph:
         self.interaction_traces = []
         routing_decisions = []
         total_tokens = 0
+        self.kv_cache_hits = 0
+        self.loop_detections = 0
+        self.termination_attempts = 0
 
         print(f"\n{'=' * 60}")
-        print(f"CoRe v4.2: Starting Cognitive Relay")
+        print(f"CoRe v4.3.2: Starting Cognitive Relay (Fixed Termination)")
+        print(f"Decision Maker ID: {self.decision_maker.id}")
         print(f"Task: {task[:100]}...")
         print(f"{'=' * 60}\n")
 
-        # **Step 0: 冷启动 (Reranker)**
+        # **Step 0: 冷启动**
         print("=== Step 0: Cold Start (Reranker) ===")
         profiles = {
             agent_id: self.mind_registry.get_agent_profile(agent_id).to_text()
@@ -176,14 +180,22 @@ class CoReGraph:
         current_agent = await self.unified_ranker.cold_start(task, profiles)
         print(f"Cold Start Selected: {current_agent}\n")
 
+        routing_decisions.append({
+            'step': 0,
+            'selected': current_agent,
+            'reasoning': 'Cold start selection by Reranker based on task-profile similarity',
+            'suggestion': 'Analyze the task and provide your expert perspective',
+            'method': 'reranker'
+        })
+
         current_output = None
-        insight_instruction = None
+        insight_instruction = "Analyze the task and provide your expert perspective"
 
         # **主循环**
         for step in range(self.max_routing):
             print(f"\n--- Step {step + 1}/{self.max_routing} ---")
 
-            # **Step 1: Retrieve (Reranker) - RAG检索**
+            # **Step 1: RAG检索**
             print("Step 1: RAG Retrieval (Reranker)")
             retrieved_context = self.unified_ranker.retrieve(
                 task=task,
@@ -193,23 +205,22 @@ class CoReGraph:
             if retrieved_context:
                 print(f"Retrieved {len(retrieved_context.split('---'))} items from history")
 
-            # **Step 2: Execute - Agent执行**
+            # **Step 2: Execute**
             print(f"Step 2: Executing {current_agent}...")
             agent = await self._get_agent_instance(current_agent)
 
-            # **v4.2关键修改**: 准备 agent_input (包含完整上下文)
             agent_input = input_dict.copy()
             agent_input['retrieved_history'] = retrieved_context
             if insight_instruction:
                 agent_input['insight'] = insight_instruction
 
-            agent_output = await self._execute_agent(agent, agent_input)
+            agent_output, agent_execution_history = await self._execute_agent(agent, agent_input)
             print(f"Output preview: {agent_output[:100]}...")
+            print(f"✓ Received execution history with {len(agent_execution_history)} messages")
 
-            # **Step 3: Store - 存入历史列表**
+            # **Step 3: Store**
             self.history_trace.append(agent_output)
 
-            # 记录trace
             self.current_trace.append({
                 'step': step + 1,
                 'agent': current_agent,
@@ -218,10 +229,9 @@ class CoReGraph:
                 'insight': insight_instruction
             })
 
-            # **Step 4: Post-hoc Route (LLM) - 决策下一棒**
-            print("Step 4: Post-hoc Routing (LLM)...")
+            # **Step 4: Post-hoc Route**
+            print("Step 4: Post-hoc Routing (LLM with Fixed Termination)...")
 
-            # 获取候选Agent
             candidate_agents = [
                 role.lower().replace(' ', '_')
                 for role in self.available_roles
@@ -229,39 +239,48 @@ class CoReGraph:
             ]
             candidate_agents.append(self.decision_maker.id)
 
-            # 获取当前Agent的私有上下文
             context = self.mind_registry.get_context_for_routing(
                 current_agent=current_agent,
                 candidate_agents=candidate_agents,
                 task_description=task
             )
 
-            # **v4.2关键修改**: 调用LLM路由时传入完整上下文
             routing_decision = await self.unified_ranker.route_llm(
                 task=task,
                 current_output=agent_output,
                 current_agent_id=current_agent,
                 candidate_agents=candidate_agents,
                 context_from_registry=context,
-                agent_input_context=agent_input,  # **新增**
-                routing_history=routing_decisions  # **新增**
+                agent_input_context=agent_input,
+                routing_history=routing_decisions,
+                agent_execution_history=agent_execution_history
             )
+
+            # **统计**
+            if routing_decision.kv_cache_used:
+                self.kv_cache_hits += 1
+                print(f"✓ KV Cache HIT (Total: {self.kv_cache_hits}/{step + 1})")
+
+            if routing_decision.loop_detected:
+                self.loop_detections += 1
+                print(f"⚠ Loop detected (Total: {self.loop_detections})")
 
             print(f"Selected: {routing_decision.selected_agent}")
             print(f"Reasoning: {routing_decision.reasoning[:80]}...")
             print(f"Suggestion: {routing_decision.insight_instruction}")
 
-            # **v4.2修改**: 存储决策（移除confidence）
             routing_decisions.append({
                 'step': step + 1,
                 'selected': routing_decision.selected_agent,
                 'reasoning': routing_decision.reasoning,
                 'suggestion': routing_decision.insight_instruction,
+                'method': 'llm_with_kv_cache' if routing_decision.kv_cache_used else 'llm_full_prompt',
+                'loop_detected': routing_decision.loop_detected
             })
 
             total_tokens += routing_decision.cost_tokens
 
-            # **检查是否选择了Decision Maker (终止条件)**
+            # **检查终止条件（v4.3.2: 更严格的检查）**
             if routing_decision.selected_agent == self.decision_maker.id:
                 print("\n🎯 Decision maker selected - reaching consensus...")
 
@@ -270,15 +289,19 @@ class CoReGraph:
                 )
 
                 execution_time = time.time() - start_time
+                cache_hit_rate = self.kv_cache_hits / (step + 1) if step > 0 else 0
 
                 print(f"\n{'=' * 60}")
-                print(f"CoRe v4.2: Relay Complete")
-                print(f"Total Steps: {step + 1}")
+                print(f"CoRe v4.3.2: Relay Complete")
+                print(f"Total Steps: {step + 1} (+ 1 cold start)")
+                print(f"Routing Path: {' -> '.join([d['selected'] for d in routing_decisions])}")
+                print(f"KV Cache Hit Rate: {cache_hit_rate:.1%}")
+                print(f"Loop Detections: {self.loop_detections}")
+                print(f"Termination Attempts: {self.unified_ranker.stats['termination_attempts']}")
                 print(f"Time: {execution_time:.2f}s")
                 print(f"Tokens: {total_tokens}")
                 print(f"{'=' * 60}\n")
 
-                # 保存记忆和进化
                 self.mind_registry.save()
 
                 result = CoReResult(
@@ -288,18 +311,21 @@ class CoReGraph:
                     belief_updates=[],
                     total_time=execution_time,
                     total_cost_tokens=total_tokens,
-                    success=True
+                    success=True,
+                    kv_cache_hits=self.kv_cache_hits,
+                    loop_detections=self.loop_detections
                 )
 
                 return result
 
-            # 更新状态用于下一轮
+            # 更新状态
             current_agent = routing_decision.selected_agent
             current_output = agent_output
             insight_instruction = routing_decision.insight_instruction
 
         # 达到最大步数
         print("\n⚠️  Max routing steps reached - forcing decision...")
+        print(f"Final Routing Path: {' -> '.join([d['selected'] for d in routing_decisions])}")
         final_output = await self._execute_decision_maker(input_dict, self.history_trace)
 
         result = CoReResult(
@@ -309,7 +335,9 @@ class CoReGraph:
             belief_updates=[],
             total_time=time.time() - start_time,
             total_cost_tokens=total_tokens,
-            success=False
+            success=False,
+            kv_cache_hits=self.kv_cache_hits,
+            loop_detections=self.loop_detections
         )
 
         return result
@@ -342,13 +370,27 @@ class CoReGraph:
         return agent
 
     @weave.op()
-    async def _execute_agent(self, agent, input_dict: Dict) -> str:
-        """执行Agent并返回输出"""
-        await agent.async_execute(input_dict)
+    async def _execute_agent(
+            self,
+            agent,
+            input_dict: Dict
+    ) -> Tuple[str, List[Dict[str, str]]]:
+        """执行Agent并返回 (输出, 对话历史)"""
+        result = await agent.async_execute(input_dict)
 
-        if agent.outputs:
-            return agent.outputs[-1]
-        return "No output generated"
+        if isinstance(result, tuple) and len(result) == 2:
+            outputs_list, messages = result
+            if outputs_list:
+                output = outputs_list[-1]
+            else:
+                output = "No output generated"
+            return output, messages
+        else:
+            if result:
+                output = result[-1]
+            else:
+                output = "No output generated"
+            return output, []
 
     async def _execute_decision_maker(
             self,
@@ -378,7 +420,9 @@ class CoReGraph:
             'routing': ranker_stats,
             'evolution': evolution_stats,
             'total_beliefs': len(self.mind_registry.beliefs),
-            'registered_agents': len(self.mind_registry.profiles)
+            'registered_agents': len(self.mind_registry.profiles),
+            'kv_cache_hits': self.kv_cache_hits,
+            'loop_detections': self.loop_detections
         }
 
 

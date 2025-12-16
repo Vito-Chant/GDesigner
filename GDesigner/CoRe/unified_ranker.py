@@ -1,21 +1,17 @@
 """
-CoRe Framework v4.1: Unified Ranker Module
-System 1.5 (Reranker) + System 2 (LLM) 混合架构
+CoRe Framework v4.3.2: Unified Ranker Module - 修复终止逻辑
+System 1.5 (Reranker) + System 2 (LLM with Path Awareness + Proper Termination)
 
-关键设计：
-1. Reranker用于冷启动和RAG检索（直接对文本打分，无需向量库）
-2. LLM用于事后路由和见解生成（复杂推理和策略规划）
-
-v4.2 更新：
-- 移除 Confidence 字段
-- 强制 CoT (先 REASONING 再 SELECTED)
-- Insight 改为 SUGGESTION (建议性而非指令性)
-- 路由决策时注入 Agent Input Context 和 Routing History
+v4.3.2 关键修复:
+- 正确处理 LLM 希望终止的情况
+- 明确告知 LLM 如何触发 Decision Maker
+- 改进错误处理和降级逻辑
 """
 
 import torch
 from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
+from collections import Counter
 
 import weave
 from sentence_transformers import CrossEncoder
@@ -24,89 +20,72 @@ import numpy as np
 
 @dataclass
 class RoutingDecision:
-    """路由决策结果 (v4.2: 移除 confidence)"""
+    """路由决策结果"""
     selected_agent: str
-    reasoning: str  # **v4.2新增**: CoT推理过程
-    path_used: str  # 'reranker_cold_start', 'llm_post_hoc'
-    insight_instruction: Optional[str]  # **v4.2改名**: 原为insight，现为suggestion
+    reasoning: str
+    path_used: str
+    insight_instruction: Optional[str]
     alternative_agents: List[Tuple[str, float]]
     cost_tokens: int
+    kv_cache_used: bool
+    loop_detected: bool
 
 
 class UnifiedRanker:
     """
-    统一的Ranker模块
+    统一的Ranker模块 (v4.3.2 修复终止逻辑版)
 
     职责划分：
     - System 1.5 (Reranker):
-      * 冷启动：从所有Agent中选择最适合的第一棒
-      * RAG检索：从历史列表中检索相关上下文
+      * 冷启动: 选择第一个Agent
+      * RAG检索: 从历史中检索上下文
 
-    - System 2 (LLM):
-      * 事后路由：基于当前Agent的私有视角决策下一棒
-      * 见解生成：为下一个Agent生成战略性Suggestion
+    - System 2 (LLM with Proper Termination):
+      * 事后路由: 复用历史 + 强化路径感知
+      * **正确终止**: 明确引导 LLM 选择 Decision Maker
+      * 循环检测: 防止 Agent 死循环
+      * 见解生成: 生成战略性Suggestion
     """
 
     def __init__(
             self,
-            llm,  # LLM实例（用于慢路径）
+            llm,
             reranker_model_name: str = "BAAI/bge-reranker-v2-m3",
+            max_loop_count: int = 2,
+            decision_maker_id: str = "final_refer"  # **v4.3.2新增**
     ):
-        """
-        初始化Unified Ranker
-
-        Args:
-            llm: LLM实例，用于复杂的路由决策和Insight生成
-            reranker_model_name: Cross-Encoder模型名称
-        """
+        """初始化Unified Ranker"""
         self.llm = llm
+        self.max_loop_count = max_loop_count
+        self.decision_maker_id = decision_maker_id  # **v4.3.2: 记录 Decision Maker ID**
 
-        # **关键修改**: 使用Cross-Encoder而非Bi-Encoder
-        # Cross-Encoder直接对(Query, Document)对打分，精度更高
         print(f"Loading Cross-Encoder: {reranker_model_name}")
         self.reranker = CrossEncoder(reranker_model_name)
 
-        # 统计信息
         self.stats = {
             'cold_start_count': 0,
             'rag_retrieval_count': 0,
             'post_hoc_route_count': 0,
+            'kv_cache_hits': 0,
+            'loop_detections': 0,
+            'termination_attempts': 0,  # **v4.3.2新增**
             'total_tokens_used': 0
         }
 
     async def cold_start(
             self,
             task: str,
-            profiles: Dict[str, str]  # agent_id -> profile_text
+            profiles: Dict[str, str]
     ) -> str:
-        """
-        System 1.5: 冷启动 - 使用Reranker选择第一个Agent
-
-        工作原理：
-        1. 构造所有(Task, Profile)对
-        2. Cross-Encoder计算每个Agent与Task的匹配度
-        3. 返回得分最高的Agent
-
-        Args:
-            task: 任务描述
-            profiles: 所有Agent的公开Profile字典
-
-        Returns:
-            最佳匹配的Agent ID
-        """
+        """System 1.5: 冷启动"""
         self.stats['cold_start_count'] += 1
 
         if not profiles:
             raise ValueError("No agent profiles provided for cold start")
 
-        # 构造(Query, Document)对
         agent_ids = list(profiles.keys())
         pairs = [(task, profiles[agent_id]) for agent_id in agent_ids]
-
-        # Reranker打分
         scores = self.reranker.predict(pairs)
-
-        # 选择最高分
         best_idx = np.argmax(scores)
         selected_agent = agent_ids[best_idx]
 
@@ -117,49 +96,58 @@ class UnifiedRanker:
     def retrieve(
             self,
             task: str,
-            history_list: List[str],  # 纯文本历史列表
+            history_list: List[str],
             top_k: int = 3
     ) -> str:
-        """
-        System 1.5: RAG检索 - 从历史中检索相关上下文
-
-        工作原理：
-        1. 构造所有(Task, HistoryItem)对
-        2. Cross-Encoder计算每个历史条目与Task的相关性
-        3. 返回Top-k个最相关的历史文本
-
-        **关键优势**: 无需维护向量库，直接在纯文本列表上操作
-
-        Args:
-            task: 当前任务
-            history_list: 历史输出列表（纯文本）
-            top_k: 返回Top-k个最相关的历史
-
-        Returns:
-            拼接的相关历史文本
-        """
+        """System 1.5: RAG检索"""
         if not history_list:
             return ""
 
         self.stats['rag_retrieval_count'] += 1
 
-        # 构造(Query, Document)对
         pairs = [(task, history_item) for history_item in history_list]
-
-        # Reranker打分
         scores = self.reranker.predict(pairs)
-
-        # 选择Top-k
         top_k = min(top_k, len(history_list))
-        top_indices = np.argsort(scores)[-top_k:][::-1]  # 降序排列
-
-        # 提取对应的文本
+        top_indices = np.argsort(scores)[-top_k:][::-1]
         retrieved_texts = [history_list[i] for i in top_indices]
 
         print(f"[RAG] Retrieved {top_k} items from {len(history_list)} history entries")
 
-        # 用分隔符拼接
         return "\n\n---\n\n".join(retrieved_texts)
+
+    def _detect_loop(
+            self,
+            routing_history: List[Dict],
+            current_agent: str,
+            candidate_agent: str
+    ) -> Tuple[bool, str]:
+        """检测路由循环"""
+        if not routing_history or len(routing_history) < 2:
+            return False, ""
+
+        agent_sequence = [current_agent]
+        for decision in routing_history:
+            agent_sequence.append(decision.get('selected', ''))
+
+        agent_counts = Counter(agent_sequence)
+
+        # 检测短期往复
+        recent_path = agent_sequence[-3:] if len(agent_sequence) >= 3 else agent_sequence
+
+        if len(recent_path) >= 2:
+            if recent_path[-1] == current_agent and recent_path[-2] == candidate_agent:
+                loop_count = agent_counts[current_agent]
+                if loop_count >= self.max_loop_count:
+                    warning = f"⚠ LOOP DETECTED: {current_agent} ↔ {candidate_agent} (Count: {loop_count})"
+                    self.stats['loop_detections'] += 1
+                    return True, warning
+
+        # 检测长期停滞
+        if agent_counts[candidate_agent] >= 3:
+            warning = f"⚠ REPEATED AGENT: {candidate_agent} already used {agent_counts[candidate_agent]} times"
+            return True, warning
+
+        return False, ""
 
     @weave.op()
     async def route_llm(
@@ -168,66 +156,90 @@ class UnifiedRanker:
             current_output: str,
             current_agent_id: str,
             candidate_agents: List[str],
-            context_from_registry: str,  # 来自MindRegistry的上下文（包含私有信念）
-            agent_input_context: Dict,  # **v4.2新增**: Agent完整输入上下文
-            routing_history: List[Dict]  # **v4.2新增**: 历史路由决策
+            context_from_registry: str,
+            agent_input_context: Dict,
+            routing_history: List[Dict],
+            agent_execution_history: List[Dict[str, str]]
     ) -> RoutingDecision:
         """
-        System 2: 事后路由 + 见解生成 (v4.2增强)
+        System 2: 事后路由 (v4.3.2 修复终止逻辑版)
 
-        这是LLM的核心决策环节：
-        1. 基于当前Agent的主观视角（私有信念）
-        2. 分析Task和当前Output
-        3. **考虑Agent的输入上下文和路径历史**
-        4. 决定下一个最合适的Agent
-        5. **生成Suggestion**：建议性指导（非强制指令）
-
-        Args:
-            task: 原始任务
-            current_output: 当前Agent的输出
-            current_agent_id: 当前Agent的ID（视角）
-            candidate_agents: 候选Agent列表
-            context_from_registry: MindRegistry提供的上下文（含私有信念）
-            agent_input_context: 当前Agent的完整输入（含RAG/Insight）
-            routing_history: 历史路由路径
-
-        Returns:
-            RoutingDecision包含：
-            - selected_agent: 下一个Agent
-            - reasoning: CoT推理过程
-            - insight_instruction: 战略性建议
+        **v4.3.2 核心改进**:
+        1. 明确告知 LLM Decision Maker 的名称和作用
+        2. 改进解析逻辑，正确处理终止意图
+        3. 增强错误处理和降级策略
         """
         self.stats['post_hoc_route_count'] += 1
 
-        # 构建Prompt (v4.2增强版)
-        prompt = self._build_llm_route_prompt(
+        # **Step 1: 循环预检测**
+        loop_warnings = {}
+        for candidate in candidate_agents:
+            is_loop, warning = self._detect_loop(routing_history, current_agent_id, candidate)
+            if is_loop:
+                loop_warnings[candidate] = warning
+                print(warning)
+
+        # **Step 2: 构建增强的路由指令（v4.3.2: 明确 Decision Maker）**
+        routing_instruction = self._build_enhanced_routing_instruction(
             task, current_output, current_agent_id,
             candidate_agents, context_from_registry,
-            agent_input_context, routing_history
+            agent_input_context, routing_history,
+            loop_warnings
         )
 
-        # 调用LLM
-        messages = [
-            {
-                'role': 'system',
-                'content': 'You are an expert at task delegation and strategic planning in multi-agent systems.'
-            },
-            {'role': 'user', 'content': prompt}
-        ]
+        # **Step 3: KV Cache 复用或降级**
+        kv_cache_used = False
+        if agent_execution_history and len(agent_execution_history) >= 2:
+            messages = agent_execution_history.copy()
+            messages.append({'role': 'user', 'content': routing_instruction})
+            kv_cache_used = True
+            self.stats['kv_cache_hits'] += 1
+            print(f"✓ Using KV Cache: Appending routing instruction to {len(agent_execution_history)} messages")
+        else:
+            print(f"⚠ KV Cache unavailable, building full prompt")
+            full_prompt = self._build_fallback_prompt(
+                task, current_output, current_agent_id,
+                candidate_agents, context_from_registry,
+                agent_input_context, routing_history,
+                loop_warnings
+            )
+            messages = [
+                {'role': 'system', 'content': 'You are an expert at task delegation and strategic planning.'},
+                {'role': 'user', 'content': full_prompt}
+            ]
 
+        # **Step 4: 调用LLM**
         response = await self.llm.agen(messages)
 
-        # 解析响应 (v4.2适配CoT格式)
-        selected_agent, reasoning, suggestion = self._parse_llm_route_response(
+        # **Step 5: 解析响应（v4.3.2: 改进解析逻辑）**
+        selected_agent, reasoning, suggestion, termination_requested = self._parse_llm_route_response_v2(
             response, candidate_agents
         )
 
-        # 估算token成本
-        token_cost = len(prompt.split()) + len(response.split())
+        # **Step 6: 处理终止请求**
+        if termination_requested:
+            self.stats['termination_attempts'] += 1
+            print(f"[Termination] LLM requested to end chain, routing to Decision Maker")
+            selected_agent = self.decision_maker_id
+            suggestion = "Synthesize all agent outputs and provide the final answer"
+
+        # **Step 7: 循环后验检测**
+        is_loop, _ = self._detect_loop(routing_history, current_agent_id, selected_agent)
+
+        # **Step 8: Token 统计**
+        if kv_cache_used:
+            token_cost = len(routing_instruction.split()) + len(response.split())
+        else:
+            token_cost = len(messages[1]['content'].split()) + len(response.split())
+
         self.stats['total_tokens_used'] += token_cost
 
         print(f"[LLM Route] {current_agent_id} -> {selected_agent}")
-        print(f"[Reasoning] {reasoning[:100]}..." if len(reasoning) > 100 else f"[Reasoning] {reasoning}")
+        print(f"[KV Cache] {'HIT' if kv_cache_used else 'MISS'}")
+        if is_loop:
+            print(f"[Loop] DETECTED but LLM chose it anyway")
+        if termination_requested:
+            print(f"[Termination] Requested by LLM")
 
         return RoutingDecision(
             selected_agent=selected_agent,
@@ -235,10 +247,12 @@ class UnifiedRanker:
             path_used='llm_post_hoc',
             insight_instruction=suggestion,
             alternative_agents=[(cand, 0.0) for cand in candidate_agents if cand != selected_agent],
-            cost_tokens=token_cost
+            cost_tokens=token_cost,
+            kv_cache_used=kv_cache_used,
+            loop_detected=is_loop
         )
 
-    def _build_llm_route_prompt(
+    def _build_enhanced_routing_instruction(
             self,
             task: str,
             current_output: str,
@@ -246,32 +260,152 @@ class UnifiedRanker:
             candidate_agents: List[str],
             context: str,
             agent_input_context: Dict,
-            routing_history: List[Dict]
+            routing_history: List[Dict],
+            loop_warnings: Dict[str, str]
     ) -> str:
         """
-        构建LLM路由的Prompt (v4.2重构版)
-
-        **关键改进**:
-        1. 强制CoT：先REASONING后SELECTED
-        2. Insight改为SUGGESTION（建议性）
-        3. 注入Agent Input Context和Routing History
-        4. 移除Confidence要求
+        构建增强的路由指令 (v4.3.2: 明确终止机制)
         """
 
-        # === 构建Agent Input Context描述 ===
-        input_context_str = ""
-        if 'retrieved_history' in agent_input_context and agent_input_context['retrieved_history']:
-            input_context_str += f"\n**RAG Context Provided**: Yes\n"
-        if 'insight' in agent_input_context and agent_input_context['insight']:
-            input_context_str += f"**Previous Suggestion**: {agent_input_context['insight']}\n"
-
-        # === 构建Routing History描述 ===
-        history_str = ""
+        # === 1. 构建详细的路径历史 ===
         if routing_history:
-            history_str = "\n=== ROUTING PATH SO FAR ===\n"
-            for i, decision in enumerate(routing_history[-3:], 1):  # 最近3步
-                history_str += f"Step {i}: {decision.get('selected', 'Unknown')} "
-                history_str += f"(Reasoning: {decision.get('reasoning', 'N/A')[:50]}...)\n"
+            path_summary = "\n=== DETAILED ROUTING PATH ===\n"
+            path_summary += f"Step 0 (Cold Start): → {routing_history[0].get('selected', 'Unknown')}\n"
+
+            for i, decision in enumerate(routing_history, 1):
+                selected = decision.get('selected', 'Unknown')
+                reasoning = decision.get('reasoning', 'N/A')
+                suggestion = decision.get('suggestion', 'N/A')
+
+                path_summary += f"\nStep {i}: → {selected}\n"
+                path_summary += f"  Reasoning: {reasoning[:100]}{'...' if len(reasoning) > 100 else ''}\n"
+                path_summary += f"  Suggestion: {suggestion[:80]}{'...' if len(suggestion) > 80 else ''}\n"
+
+            path_summary += f"\nStep {len(routing_history) + 1} (Current): You are {current_agent_id}\n"
+            path_summary += "=== END OF PATH ===\n"
+        else:
+            path_summary = f"\n=== ROUTING PATH ===\nThis is Step 1 right after cold start.\nYou are the first agent: {current_agent_id}\n=== END OF PATH ===\n"
+
+        # === 2. 构建循环警告 ===
+        loop_warning_str = ""
+        if loop_warnings:
+            loop_warning_str = "\n⚠️ === CRITICAL: LOOP WARNINGS === ⚠️\n"
+            for agent, warning in loop_warnings.items():
+                loop_warning_str += f"- {agent}: {warning}\n"
+            loop_warning_str += "Please AVOID selecting agents with loop warnings unless absolutely necessary.\n"
+            loop_warning_str += "=== END OF WARNINGS ===\n"
+
+        # === 3. 识别 Decision Maker ===
+        decision_maker = None
+        regular_agents = []
+        for agent in candidate_agents:
+            if 'final' in agent.lower() or 'decision' in agent.lower():
+                decision_maker = agent
+            else:
+                regular_agents.append(agent)
+
+        # === 4. 构建候选信息（v4.3.2: 明确 Decision Maker）===
+        candidates_info = ""
+        if regular_agents:
+            candidates_info += f"\n**Regular Agents** (for continued analysis): {', '.join(regular_agents)}\n"
+        if decision_maker:
+            candidates_info += f"\n**Decision Maker** (to END the chain): `{decision_maker}`\n"
+            candidates_info += "  → Select this when the task is fully resolved and you want to produce the final answer.\n"
+
+        # === 5. 组装完整指令（v4.3.2: 强化终止指引）===
+        instruction = f"""
+=== ROLE SWITCH: YOU ARE NOW THE COORDINATOR ===
+
+Excellent work on the analysis above. Now, please step back and act as the **Coordinator** to decide the next step.
+
+{path_summary}
+
+**IMPORTANT: Path Analysis**
+- Review the ENTIRE routing path above
+- Identify patterns: Are we making progress or circling?
+- Consider what each agent has already contributed
+- Avoid selecting agents that would create loops or redundancy
+
+{loop_warning_str}
+
+**Your Beliefs About Candidates**:
+{context}
+
+**Available Candidates**:
+{candidates_info}
+
+**CRITICAL DECISION CRITERIA**:
+1. **If the task is FULLY SOLVED and no more analysis is needed:**
+   - Select the Decision Maker: `{decision_maker if decision_maker else 'final_refer'}`
+   - This will END the routing chain and produce the final answer
+
+2. **If the task needs MORE work (new perspective, verification, implementation):**
+   - Select an appropriate regular agent
+   - Provide a clear suggestion for what they should focus on
+
+3. **NEVER select "none" or invalid names** - always choose from the list above
+
+**Decision Format** (MUST follow exactly):
+REASONING: <detailed analysis: Is task complete? What's missing? Loop risks?>
+SELECTED: <exact agent name from the list above>
+SUGGESTION: <brief, actionable advice - under 50 words>
+
+**Remember**: 
+- The routing path is CRUCIAL - don't ignore it!
+- If the task is solved, SELECT THE DECISION MAKER to end the chain
+- Only continue routing if NEW value can be added
+- Use the EXACT agent names from the candidate list
+"""
+        return instruction
+
+    def _build_fallback_prompt(
+            self,
+            task: str,
+            current_output: str,
+            current_agent_id: str,
+            candidate_agents: List[str],
+            context: str,
+            agent_input_context: Dict,
+            routing_history: List[Dict],
+            loop_warnings: Dict[str, str]
+    ) -> str:
+        """
+        降级方案：构建完整 Prompt (v4.3.2: 包含终止指引)
+        """
+
+        # 详细路径历史
+        if routing_history:
+            history_str = "\n=== COMPLETE ROUTING PATH ===\n"
+            history_str += f"Step 0 (Cold Start): → {routing_history[0].get('selected', 'Unknown')}\n"
+
+            for i, decision in enumerate(routing_history, 1):
+                selected = decision.get('selected', 'Unknown')
+                reasoning = decision.get('reasoning', 'N/A')
+                suggestion = decision.get('suggestion', 'N/A')
+
+                history_str += f"\nStep {i}: → {selected}\n"
+                history_str += f"  Why: {reasoning[:150]}{'...' if len(reasoning) > 150 else ''}\n"
+                history_str += f"  Suggestion Given: {suggestion[:100]}{'...' if len(suggestion) > 100 else ''}\n"
+
+            history_str += f"\nStep {len(routing_history) + 1} (You): {current_agent_id}\n"
+            history_str += "=== END OF PATH ===\n"
+        else:
+            history_str = f"\n=== ROUTING PATH ===\nStep 1 (First): You are {current_agent_id}\n=== END OF PATH ===\n"
+
+        # 循环警告
+        loop_warning_str = ""
+        if loop_warnings:
+            loop_warning_str = "\n⚠️ === LOOP WARNINGS === ⚠️\n"
+            for agent, warning in loop_warnings.items():
+                loop_warning_str += f"- {warning}\n"
+            loop_warning_str += "Avoid these agents unless truly necessary.\n=== END OF WARNINGS ===\n"
+
+        # 识别 Decision Maker
+        decision_maker = None
+        for agent in candidate_agents:
+            if 'final' in agent.lower() or 'decision' in agent.lower():
+                decision_maker = agent
+                break
 
         prompt = f"""You are {current_agent_id}, coordinating a multi-agent system to solve a complex task.
 
@@ -281,9 +415,9 @@ class UnifiedRanker:
 === YOUR RECENT OUTPUT ===
 {current_output}
 
-{input_context_str}
-
 {history_str}
+
+{loop_warning_str}
 
 === YOUR PERSPECTIVE (Private Beliefs) ===
 {context}
@@ -291,44 +425,34 @@ class UnifiedRanker:
 === CANDIDATE AGENTS ===
 {', '.join(candidate_agents)}
 
+**Decision Maker**: `{decision_maker if decision_maker else 'final_refer'}` - Select this to END the chain
+
 === YOUR DECISION ===
-Based on:
-1. The task requirements
-2. Your output and the context you received
-3. The routing path taken so far
-4. Your beliefs about each candidate's capabilities
+**CRITICAL**: 
+1. Review the COMPLETE routing path above
+2. Assess: Is the task fully resolved? Or does it need more work?
+3. If RESOLVED: Select the Decision Maker ({decision_maker}) to end the chain
+4. If NOT: Select an agent that brings NEW value
 
-Please decide:
-1. **First, explain your reasoning** (analyze the situation)
-2. **Then, select the MOST SUITABLE next agent**
-3. **Finally, provide a SUGGESTION** (not a command, but advice)
-   - What aspect should they consider?
-   - What pitfalls might exist?
-   - How can they build on your work?
+**DO NOT** select invalid names like "none" - use the exact names from the candidate list.
 
-**CRITICAL**: Respond in this EXACT format (REASONING must come first):
-
-REASONING: <your step-by-step analysis of why this agent is best>
-SELECTED: <agent_id>
-SUGGESTION: <brief, actionable advice for the next agent - keep it under 50 words>
+Respond in this EXACT format:
+REASONING: <detailed analysis considering path history, completeness, and loop risks>
+SELECTED: <exact agent name from candidates list>
+SUGGESTION: <brief, actionable advice - under 50 words>
 """
         return prompt
 
-    def _parse_llm_route_response(
+    def _parse_llm_route_response_v2(
             self,
             response: str,
             candidate_agents: List[str]
-    ) -> Tuple[str, str, str]:
+    ) -> Tuple[str, str, str, bool]:
         """
-        解析LLM路由响应 (v4.2适配CoT格式)
-
-        期望格式：
-        REASONING: ...
-        SELECTED: agent_id
-        SUGGESTION: ...
+        解析LLM路由响应 (v4.3.2: 增强版)
 
         Returns:
-            (selected_agent, reasoning, suggestion)
+            (selected_agent, reasoning, suggestion, termination_requested)
         """
 
         lines = response.strip().split('\n')
@@ -336,7 +460,9 @@ SUGGESTION: <brief, actionable advice for the next agent - keep it under 50 word
         selected_agent = None
         reasoning = ""
         suggestion = ""
+        termination_requested = False
 
+        # **Step 1: 标准解析**
         for line in lines:
             line = line.strip()
             if line.startswith('REASONING:'):
@@ -346,12 +472,42 @@ SUGGESTION: <brief, actionable advice for the next agent - keep it under 50 word
             elif line.startswith('SUGGESTION:'):
                 suggestion = line.replace('SUGGESTION:', '').strip()
 
-        # 容错处理
-        if not selected_agent or selected_agent not in candidate_agents:
-            print(f"[Warning] Invalid selection '{selected_agent}', using first candidate")
-            selected_agent = candidate_agents[0]
-            reasoning = reasoning or "Failed to parse LLM response, using first candidate as fallback"
-            suggestion = "Please continue the task using your expertise"
+        # **Step 2: 检测终止意图**
+        termination_keywords = ['none', 'end', 'stop', 'finish', 'complete', 'resolved', 'done']
+        if selected_agent:
+            selected_lower = selected_agent.lower()
+            if any(keyword in selected_lower for keyword in termination_keywords):
+                termination_requested = True
+                print(f"[Parse] Detected termination intent: '{selected_agent}'")
+
+        # **Step 3: 检测推理中的终止意图**
+        if reasoning:
+            reasoning_lower = reasoning.lower()
+            if ('no further' in reasoning_lower or
+                'fully resolved' in reasoning_lower or
+                'task is complete' in reasoning_lower or
+                'end the chain' in reasoning_lower):
+                termination_requested = True
+                print(f"[Parse] Detected termination intent in reasoning")
+
+        # **Step 4: 容错处理**
+        if not selected_agent or selected_agent.lower() not in [a.lower() for a in candidate_agents]:
+            print(f"[Warning] Invalid/missing selection: '{selected_agent}'")
+
+            # 如果明确要求终止，找 Decision Maker
+            if termination_requested:
+                for agent in candidate_agents:
+                    if 'final' in agent.lower() or 'decision' in agent.lower():
+                        selected_agent = agent
+                        print(f"[Fallback] Routing to Decision Maker: {selected_agent}")
+                        break
+
+            # 否则使用第一个候选
+            if not selected_agent or selected_agent.lower() not in [a.lower() for a in candidate_agents]:
+                selected_agent = candidate_agents[0]
+                reasoning = reasoning or "Failed to parse LLM response, using fallback"
+                suggestion = "Please continue the task using your expertise"
+                print(f"[Fallback] Using first candidate: {selected_agent}")
 
         if not suggestion:
             suggestion = "Build on the previous work and focus on quality"
@@ -359,97 +515,26 @@ SUGGESTION: <brief, actionable advice for the next agent - keep it under 50 word
         if not reasoning:
             reasoning = "Selection based on agent capabilities"
 
-        return selected_agent, reasoning, suggestion
+        return selected_agent, reasoning, suggestion, termination_requested
 
     def get_statistics(self) -> Dict:
-        """获取统计信息"""
+        """获取统计信息 (v4.3.2: 新增终止统计)"""
         total_ops = (self.stats['cold_start_count'] +
                      self.stats['rag_retrieval_count'] +
                      self.stats['post_hoc_route_count'])
 
+        kv_cache_hit_rate = 0.0
+        if self.stats['post_hoc_route_count'] > 0:
+            kv_cache_hit_rate = self.stats['kv_cache_hits'] / self.stats['post_hoc_route_count']
+
         return {
             **self.stats,
             'total_operations': total_ops,
+            'kv_cache_hit_rate': kv_cache_hit_rate,
+            'loop_detection_rate': self.stats['loop_detections'] / self.stats['post_hoc_route_count'] if self.stats['post_hoc_route_count'] > 0 else 0,
+            'termination_attempt_rate': self.stats['termination_attempts'] / self.stats['post_hoc_route_count'] if self.stats['post_hoc_route_count'] > 0 else 0,
             'avg_tokens_per_llm_route': (
                 self.stats['total_tokens_used'] / self.stats['post_hoc_route_count']
                 if self.stats['post_hoc_route_count'] > 0 else 0
             )
         }
-
-
-# ==================== 使用示例 ====================
-
-if __name__ == "__main__":
-    import asyncio
-
-    # Mock LLM用于测试
-    class MockLLM:
-        async def agen(self, messages):
-            return """REASONING: The current mathematical analysis is complete and requires translation into executable code. The code expert has proven track record in numerical implementations and can handle edge cases like division by zero with proper validation.
-SELECTED: code_expert_1
-SUGGESTION: Focus on input validation before applying the formula. Consider edge cases where a=0. Return None or raise a clear exception for invalid inputs."""
-
-    async def test_unified_ranker():
-        print("="*70)
-        print("CoRe v4.2 - Unified Ranker Test Suite")
-        print("="*70)
-
-        llm = MockLLM()
-        ranker = UnifiedRanker(
-            llm=llm,
-            reranker_model_name="BAAI/bge-reranker-v2-m3"
-        )
-
-        # ===== 测试: LLM路由 (v4.2) =====
-        print("\n[TEST] LLM Post-hoc Routing (v4.2)")
-        print("-"*70)
-
-        context_from_registry = """
-Your beliefs about candidates:
-
-About code_expert_1:
-- Excellent at translating mathematical concepts into clean, executable code (confidence: 0.85)
-- Has successfully handled similar numerical computation tasks before (evidence: 5 interactions)
-
-About math_solver_2:
-- Strong in theoretical proofs but less experienced in practical implementation (confidence: 0.60)
-"""
-
-        agent_input_context = {
-            'task': "Implement the quadratic formula",
-            'retrieved_history': "Previous analysis showed discriminant = 49",
-            'insight': "Focus on numerical stability"
-        }
-
-        routing_history = [
-            {'selected': 'math_solver_1', 'reasoning': 'Initial analysis needed'}
-        ]
-
-        decision = await ranker.route_llm(
-            task="Implement the quadratic formula to solve ax^2 + bx + c = 0",
-            current_output="I've completed the mathematical analysis: discriminant is 49, two real solutions expected",
-            current_agent_id="math_solver_1",
-            candidate_agents=["code_expert_1", "math_solver_2", "decision_maker"],
-            context_from_registry=context_from_registry,
-            agent_input_context=agent_input_context,
-            routing_history=routing_history
-        )
-
-        print(f"✓ Selected Agent: {decision.selected_agent}")
-        print(f"✓ Reasoning: {decision.reasoning[:100]}...")
-        print(f"✓ Suggestion: {decision.insight_instruction}")
-        print(f"✓ Token Cost: {decision.cost_tokens}")
-
-        # ===== 统计信息 =====
-        print("\n[STATISTICS]")
-        print("-"*70)
-        stats = ranker.get_statistics()
-        for key, value in stats.items():
-            print(f"{key}: {value}")
-
-        print("\n" + "="*70)
-        print("All tests completed successfully! ✓")
-        print("="*70)
-
-    # 运行测试
-    asyncio.run(test_unified_ranker())
