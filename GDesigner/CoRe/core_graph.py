@@ -1,6 +1,6 @@
 """
-CoRe Framework: Main Graph Implementation
-Integrates all components into a complete Cognitive Relay system
+CoRe Framework v4.1: Main Graph Implementation
+完整集成：Retrieve(Reranker) -> Execute -> Store(List) -> Route(LLM)
 """
 
 import sys
@@ -17,16 +17,15 @@ import time
 from GDesigner.graph.graph import Graph
 from GDesigner.agents.agent_registry import AgentRegistry
 from GDesigner.llm.llm_registry import LLMRegistry
-from sentence_transformers import SentenceTransformer
+import weave
 
 
 @dataclass
 class CoReResult:
-    """Result of a CoRe execution"""
+    """CoRe执行结果"""
     final_answer: str
     execution_trace: List[Dict]
     routing_decisions: List[Dict]
-    handoff_notes: List[str]
     belief_updates: List[Any]
     total_time: float
     total_cost_tokens: int
@@ -35,13 +34,15 @@ class CoReResult:
 
 class CoReGraph:
     """
-    Cognitive Relay Graph - Main orchestrator
+    Cognitive Relay Graph v4.1 - 主编排器
 
-    This is the complete system integrating:
-    1. Mind Registry (semantic state)
-    2. Hybrid Router (fast/slow routing)
-    3. Handoff Generator (explicit transfers)
-    4. Belief Evolver (online learning)
+    核心流程：
+    Step 0: 冷启动 (Reranker)
+    循环 (max_routing次):
+        Step 1: Retrieve (Reranker) - RAG检索历史
+        Step 2: Execute - Agent执行
+        Step 3: Store - 存储到历史列表
+        Step 4: Post-hoc Route (LLM) - 决策下一棒 + 生成Insight
     """
 
     def __init__(
@@ -52,62 +53,55 @@ class CoReGraph:
             decision_method: str = "FinalRefer",
             max_routing: int = 10,
             registry_save_path: Optional[Path] = None,
-            fast_path_threshold: float = 0.7,
-            slow_path_margin: float = 0.15
+            reranker_model: str = "BAAI/bge-reranker-v2-m3",
+            rag_top_k: int = 3
     ):
-        """Initialize CoRe Graph"""
+        """初始化CoRe Graph"""
 
-        # Import local modules
+        # 导入本地模块
         from mind_registry import MindRegistry, AgentProfile
-        from hybrid_router import HybridRouter
-        from handoff_generator import HandoffGenerator
+        from unified_ranker import UnifiedRanker
         from belief_evolver import BeliefEvolver, InteractionTrace
 
         self.domain = domain
         self.llm_name = llm_name
         self.available_roles = available_roles
         self.max_routing = max_routing
+        self.rag_top_k = rag_top_k
 
-        # Initialize LLM
+        # 初始化LLM
         self.llm = LLMRegistry.get(llm_name)
 
-        # Initialize embedding model for fast path
-        self.embedding_model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
-
-        # Initialize Mind Registry
+        # **关键修改1**: 初始化Mind Registry (去中心化互认)
         self.mind_registry = MindRegistry(save_path=registry_save_path)
         self._initialize_agent_profiles()
 
-        # Initialize Hybrid Router
-        self.hybrid_router = HybridRouter(
+        # **关键修改2**: 初始化Unified Ranker (Reranker + LLM)
+        self.unified_ranker = UnifiedRanker(
             llm=self.llm,
-            embedding_model=self.embedding_model,
-            confidence_threshold=fast_path_threshold,
-            margin_threshold=slow_path_margin
+            reranker_model_name=reranker_model
         )
 
-        # Initialize Handoff Generator
-        self.handoff_generator = HandoffGenerator(llm=self.llm)
-
-        # Initialize Belief Evolver
+        # 初始化Belief Evolver
         self.belief_evolver = BeliefEvolver(
             llm=self.llm,
             mind_registry=self.mind_registry
         )
 
-        # Initialize decision maker
+        # 初始化Decision Maker
         self.decision_maker = AgentRegistry.get(
             decision_method,
             domain=domain,
             llm_name=llm_name
         )
 
-        # Execution state
-        self.current_trace = []
+        # **关键修改3**: 执行状态 - 使用列表存储历史
+        self.history_trace = []  # List[str] - 纯文本历史
+        self.current_trace = []  # List[Dict] - 详细执行轨迹
         self.interaction_traces = []
 
     def _initialize_agent_profiles(self):
-        """Initialize agent profiles in Mind Registry from domain"""
+        """从domain初始化Agent profiles，触发互认初始化"""
 
         from mind_registry import AgentProfile
         from GDesigner.prompt.prompt_set_registry import PromptSetRegistry
@@ -118,14 +112,14 @@ class CoReGraph:
             try:
                 description = prompt_set.get_description(role)
 
-                # Parse capabilities (simplified)
+                # 简化的能力解析
                 capabilities = []
-                if "math" in role.lower() or "solver" in role.lower():
+                if "math" in role.lower():
                     capabilities = ["mathematical reasoning", "problem solving"]
-                elif "code" in role.lower() or "program" in role.lower():
-                    capabilities = ["programming", "implementation", "debugging"]
+                elif "code" in role.lower():
+                    capabilities = ["programming", "implementation"]
                 elif "analyst" in role.lower():
-                    capabilities = ["analysis", "planning", "abstraction"]
+                    capabilities = ["analysis", "planning"]
 
                 profile = AgentProfile(
                     agent_id=f"{role.lower().replace(' ', '_')}",
@@ -136,10 +130,13 @@ class CoReGraph:
                     description=description
                 )
 
+                # **关键**: register_agent会自动触发互认初始化
                 self.mind_registry.register_agent(profile)
+
             except Exception as e:
                 print(f"Warning: Could not register profile for {role}: {e}")
 
+    @weave.op()
     async def run_cognitive_relay(
             self,
             input_dict: Dict[str, str],
@@ -147,195 +144,182 @@ class CoReGraph:
             training: bool = False
     ) -> CoReResult:
         """
-        Main execution loop - The Cognitive Relay
-
-        Args:
-            input_dict: Task input with 'task' key
-            temperature: Sampling temperature
-            training: Whether in training mode
-
-        Returns:
-            CoReResult with complete execution details
+        主执行循环 - Cognitive Relay
         """
 
         start_time = time.time()
         task = input_dict['task']
 
-        # Reset state
-        self.current_trace = []
+        # 重置状态
+        self.history_trace = []  # 纯文本历史
+        self.current_trace = []  # 详细轨迹
         self.interaction_traces = []
         routing_decisions = []
-        handoff_notes = []
         total_tokens = 0
 
-        current_agent = None
-        current_output = None
-        handoff_note = None
-
         print(f"\n{'=' * 60}")
-        print(f"CoRe: Starting Cognitive Relay")
+        print(f"CoRe v4.1: Starting Cognitive Relay")
         print(f"Task: {task[:100]}...")
         print(f"{'=' * 60}\n")
 
+        # **Step 0: 冷启动 (Reranker)**
+        print("=== Step 0: Cold Start (Reranker) ===")
+        profiles = {
+            agent_id: self.mind_registry.get_agent_profile(agent_id).to_text()
+            for agent_id in [role.lower().replace(' ', '_') for role in self.available_roles]
+        }
+
+        current_agent = await self.unified_ranker.cold_start(task, profiles)
+        print(f"Cold Start Selected: {current_agent}\n")
+
+        current_output = None
+        insight_instruction = None
+
+        # **主循环**
         for step in range(self.max_routing):
             print(f"\n--- Step {step + 1}/{self.max_routing} ---")
 
-            # Get candidate agents (all available except current)
+            # **Step 1: Retrieve (Reranker) - RAG检索**
+            print("Step 1: RAG Retrieval (Reranker)")
+            retrieved_context = self.unified_ranker.retrieve(
+                task=task,
+                history_list=self.history_trace,
+                top_k=self.rag_top_k
+            )
+            if retrieved_context:
+                print(f"Retrieved {len(retrieved_context.split('---'))} items from history")
+
+            # **Step 2: Execute - Agent执行**
+            print(f"Step 2: Executing {current_agent}...")
+            agent = await self._get_agent_instance(current_agent)
+
+            # 准备输入：Task + RAG Context + Insight
+            agent_input = input_dict.copy()
+            agent_input['retrieved_history'] = retrieved_context
+            if insight_instruction:
+                agent_input['insight'] = insight_instruction
+
+            agent_output = await self._execute_agent(agent, agent_input)
+            print(f"Output preview: {agent_output[:100]}...")
+
+            # **Step 3: Store - 存入历史列表**
+            self.history_trace.append(agent_output)
+
+            # 记录trace
+            self.current_trace.append({
+                'step': step + 1,
+                'agent': current_agent,
+                'output': agent_output,
+                'retrieved_context': retrieved_context,
+                'insight': insight_instruction
+            })
+
+            # **Step 4: Post-hoc Route (LLM) - 决策下一棒**
+            print("Step 4: Post-hoc Routing (LLM)...")
+
+            # 获取候选Agent
             candidate_agents = [
                 role.lower().replace(' ', '_')
                 for role in self.available_roles
                 if role.lower().replace(' ', '_') != current_agent
             ]
-
-            # Add decision maker as final option
             candidate_agents.append(self.decision_maker.id)
 
-            # Build routing context from Mind Registry
+            # 获取当前Agent的私有上下文
             context = self.mind_registry.get_context_for_routing(
-                current_agent=current_agent or "system",
+                current_agent=current_agent,
                 candidate_agents=candidate_agents,
                 task_description=task
             )
 
-            # Get agent profile texts
-            agent_profiles_text = {}
-            for agent_id in candidate_agents:
-                profile = self.mind_registry.get_agent_profile(agent_id)
-                if profile:
-                    agent_profiles_text[agent_id] = profile.to_text()
-
-            # === ROUTING DECISION (System 1 or System 2) ===
-            routing_decision = await self.hybrid_router.route(
-                task_description=task,
-                current_agent=current_agent or "system",
+            # LLM路由决策
+            routing_decision = await self.unified_ranker.route_llm(
+                task=task,
+                current_output=agent_output,
+                current_agent_id=current_agent,
                 candidate_agents=candidate_agents,
-                agent_profiles_text=agent_profiles_text,
-                context_from_registry=context,
-                handoff_note=handoff_note
+                context_from_registry=context
             )
 
-            print(f"Router: {routing_decision.path_used.upper()} path")
             print(f"Selected: {routing_decision.selected_agent}")
+            print(f"Insight: {routing_decision.insight_instruction}")
             print(f"Confidence: {routing_decision.confidence:.2f}")
-            print(f"Reasoning: {routing_decision.reasoning[:100]}...")
 
             routing_decisions.append({
                 'step': step + 1,
                 'selected': routing_decision.selected_agent,
-                'path': routing_decision.path_used,
-                'confidence': routing_decision.confidence,
-                'reasoning': routing_decision.reasoning
+                'reasoning': routing_decision.reasoning,
+                'insight': routing_decision.insight_instruction,
+                'confidence': routing_decision.confidence
             })
 
             total_tokens += routing_decision.cost_tokens
 
-            # Check if decision maker was selected (terminal condition)
+            # **检查是否选择了Decision Maker (终止条件)**
             if routing_decision.selected_agent == self.decision_maker.id:
                 print("\n🎯 Decision maker selected - reaching consensus...")
 
-                # Execute decision maker
                 final_output = await self._execute_decision_maker(
-                    input_dict, self.current_trace
+                    input_dict, self.history_trace
                 )
 
                 execution_time = time.time() - start_time
 
                 print(f"\n{'=' * 60}")
-                print(f"CoRe: Relay Complete")
+                print(f"CoRe v4.1: Relay Complete")
                 print(f"Total Steps: {step + 1}")
                 print(f"Time: {execution_time:.2f}s")
                 print(f"Tokens: {total_tokens}")
                 print(f"{'=' * 60}\n")
 
-                return CoReResult(
+                # **保存记忆和进化**
+                self.mind_registry.save()
+
+                result = CoReResult(
                     final_answer=final_output,
                     execution_trace=self.current_trace,
                     routing_decisions=routing_decisions,
-                    handoff_notes=handoff_notes,
                     belief_updates=[],
                     total_time=execution_time,
                     total_cost_tokens=total_tokens,
                     success=True
                 )
 
-            # === AGENT EXECUTION ===
-            next_agent_id = routing_decision.selected_agent
-            next_agent = await self._get_agent_instance(next_agent_id)
+                return result
 
-            # Prepare input with handoff note if available
-            agent_input = input_dict.copy()
-            if handoff_note:
-                agent_input['hints'] = handoff_note
-
-            # Execute agent
-            print(f"Executing: {next_agent_id}...")
-            agent_output = await self._execute_agent(next_agent, agent_input)
-            print(f"Output preview: {agent_output[:100]}...")
-
-            # Record trace
-            self.current_trace.append({
-                'step': step + 1,
-                'agent': next_agent_id,
-                'output': agent_output,
-                'routing_decision': routing_decision
-            })
-
-            # === HANDOFF GENERATION ===
-            if current_agent is not None:  # Not first step
-                print("Generating handoff note...")
-
-                next_profile = self.mind_registry.get_agent_profile(next_agent_id)
-
-                handoff = await self.handoff_generator.generate_handoff_note(
-                    current_agent=current_agent,
-                    next_agent=next_agent_id,
-                    original_task=task,
-                    current_agent_output=current_output or "",
-                    full_history=self.current_trace,
-                    next_agent_profile=next_profile.to_text() if next_profile else "",
-                    routing_reasoning=routing_decision.reasoning
-                )
-
-                handoff_note = handoff.to_text()
-                handoff_notes.append(handoff_note)
-
-                print(f"Handoff confidence: {handoff.confidence_in_handoff:.2f}")
-                if handoff.warnings:
-                    print(f"⚠️  Warnings: {len(handoff.warnings)}")
-
-            # Update state for next iteration
-            current_agent = next_agent_id
+            # 更新状态用于下一轮
+            current_agent = routing_decision.selected_agent
             current_output = agent_output
+            insight_instruction = routing_decision.insight_instruction
 
-        # Max routing reached without decision
+        # 达到最大步数
         print("\n⚠️  Max routing steps reached - forcing decision...")
-        final_output = await self._execute_decision_maker(input_dict, self.current_trace)
+        final_output = await self._execute_decision_maker(input_dict, self.history_trace)
 
-        return CoReResult(
+        result = CoReResult(
             final_answer=final_output,
             execution_trace=self.current_trace,
             routing_decisions=routing_decisions,
-            handoff_notes=handoff_notes,
             belief_updates=[],
             total_time=time.time() - start_time,
             total_cost_tokens=total_tokens,
-            success=False  # Didn't converge naturally
+            success=False
         )
 
-    async def _get_agent_instance(self, agent_id: str):
-        """Get or create agent instance"""
+        return result
 
-        # Map agent_id back to role
+    async def _get_agent_instance(self, agent_id: str):
+        """获取或创建Agent实例"""
+
+        # 映射agent_id到role
         role = agent_id.replace('_', ' ').title()
 
-        # Find matching role
         for available_role in self.available_roles:
             if available_role.lower().replace(' ', '_') == agent_id:
                 role = available_role
                 break
 
-        # Create agent instance
-        # Determine agent type from domain
+        # 根据domain确定Agent类型
         if self.domain == "gsm8k":
             agent_class = "MathSolver"
         elif self.domain == "humaneval":
@@ -343,7 +327,7 @@ class CoReGraph:
         elif self.domain == "mmlu":
             agent_class = "AnalyzeAgent"
         else:
-            agent_class = "MathSolver"  # Default
+            agent_class = "MathSolver"
 
         agent = AgentRegistry.get(
             agent_class,
@@ -355,10 +339,9 @@ class CoReGraph:
         return agent
 
     async def _execute_agent(self, agent, input_dict: Dict) -> str:
-        """Execute an agent and return its output"""
+        """执行Agent并返回输出"""
 
-        # Use the async_execute_with_hints method
-        await agent.async_execute_with_hints(input_dict)
+        await agent.async_execute(input_dict)
 
         if agent.outputs:
             return agent.outputs[-1]
@@ -367,19 +350,18 @@ class CoReGraph:
     async def _execute_decision_maker(
             self,
             input_dict: Dict,
-            trace: List[Dict]
+            history: List[str]
     ) -> str:
-        """Execute decision maker with full trace"""
+        """执行Decision Maker"""
 
-        # Build context from trace
+        # 构建上下文
         spatial_info = {}
-        for i, step in enumerate(trace):
+        for i, output in enumerate(history[-5:]):  # 最近5个输出
             spatial_info[f"agent_{i}"] = {
-                'role': step['agent'],
-                'output': step['output']
+                'role': f"step_{i}",
+                'output': output
             }
 
-        # Execute decision maker
         await self.decision_maker.async_execute(input_dict)
 
         if self.decision_maker.outputs:
@@ -387,23 +369,26 @@ class CoReGraph:
         return "No decision produced"
 
     def get_statistics(self) -> Dict:
-        """Get execution statistics"""
+        """获取执行统计"""
 
-        router_stats = self.hybrid_router.get_statistics()
+        ranker_stats = self.unified_ranker.get_statistics()
         evolution_stats = self.belief_evolver.get_evolution_summary()
 
         return {
-            'routing': router_stats,
+            'routing': ranker_stats,
             'evolution': evolution_stats,
             'total_beliefs': len(self.mind_registry.beliefs),
             'registered_agents': len(self.mind_registry.profiles)
         }
 
 
-# Example usage
+# 使用示例
 if __name__ == "__main__":
+    weave.init(
+        project_name='vito_chan/G-Designer',
+    )
+
     async def test_core():
-        # Initialize CoRe Graph
         core = CoReGraph(
             domain="gsm8k",
             llm_name="Qwen/Qwen3-4B-Instruct-2507",
@@ -416,12 +401,10 @@ if __name__ == "__main__":
             max_routing=5
         )
 
-        # Test task
         input_dict = {
             "task": "Solve the equation 2x^2 + 5x - 3 = 0"
         }
 
-        # Run cognitive relay
         result = await core.run_cognitive_relay(input_dict)
 
         print("\n" + "=" * 60)
@@ -437,10 +420,9 @@ if __name__ == "__main__":
         print("STATISTICS")
         print("=" * 60)
         stats = core.get_statistics()
-        print(f"Fast path: {stats['routing']['fast_path_percentage']:.1f}%")
-        print(f"Slow path: {100 - stats['routing']['fast_path_percentage']:.1f}%")
-        print(f"Avg tokens/decision: {stats['routing']['avg_tokens_per_decision']:.0f}")
+        print(f"Cold Starts: {stats['routing']['cold_start_count']}")
+        print(f"RAG Retrievals: {stats['routing']['rag_retrieval_count']}")
+        print(f"LLM Routes: {stats['routing']['post_hoc_route_count']}")
 
 
-    # Run test
     asyncio.run(test_core())

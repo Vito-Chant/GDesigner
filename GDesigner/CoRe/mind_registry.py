@@ -1,17 +1,18 @@
 """
-CoRe Framework: Mind Registry Module
-Maintains dynamic profiles and beliefs about agents
+CoRe Framework v4.1: Mind Registry Module
+去中心化的社会关系网，支持互认初始化
 """
 
 import json
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional
 from dataclasses import dataclass, asdict
 from pathlib import Path
+from datetime import datetime
 
 
 @dataclass
 class AgentProfile:
-    """Static capability description of an agent"""
+    """静态能力描述"""
     agent_id: str
     role: str
     capabilities: List[str]
@@ -20,7 +21,7 @@ class AgentProfile:
     description: str
 
     def to_text(self) -> str:
-        """Convert profile to natural language description"""
+        """转换为自然语言描述"""
         text = f"Agent {self.agent_id} ({self.role}):\n"
         text += f"Description: {self.description}\n"
         text += f"Capabilities: {', '.join(self.capabilities)}\n"
@@ -32,24 +33,23 @@ class AgentProfile:
 
 @dataclass
 class RelationalBelief:
-    """Dynamic belief about agent interactions"""
+    """关于Agent交互的动态信念"""
     from_agent: str
     to_agent: str
     belief_type: str  # 'trust', 'capability_assessment', 'interaction_pattern'
     content: str
     confidence: float  # 0-1
-    evidence_count: int  # How many interactions support this
+    evidence_count: int
     last_updated: str
 
     def to_text(self) -> str:
-        """Convert belief to natural language"""
         return f"{self.from_agent} believes: {self.content} (confidence: {self.confidence:.2f})"
 
 
 class MindRegistry:
     """
-    Central registry maintaining all agent profiles and beliefs
-    This is the semantic state space S in the paper
+    中央注册表，维护所有Agent的profile和私有信念
+    关键特性：去中心化的"互认"初始化
     """
 
     def __init__(self, save_path: Optional[Path] = None):
@@ -57,71 +57,122 @@ class MindRegistry:
         self.beliefs: List[RelationalBelief] = []
         self.save_path = save_path
 
+        # 如果存在保存路径，尝试加载
+        if save_path and save_path.exists():
+            self.load()
+
     def register_agent(self, profile: AgentProfile):
-        """Register a new agent profile"""
+        """
+        注册新Agent，并自动进行"互认"初始化
+        """
+        # 1. 存储新Profile
         self.profiles[profile.agent_id] = profile
 
+        # 2. 互认初始化：为所有现有Agent创建对新Agent的初始信念
+        for existing_id, existing_profile in self.profiles.items():
+            if existing_id == profile.agent_id:
+                continue
+
+            # Existing -> New: 基于New的Profile生成初始信念
+            initial_belief_to_new = RelationalBelief(
+                from_agent=existing_id,
+                to_agent=profile.agent_id,
+                belief_type='capability_assessment',
+                content=f"New agent with role {profile.role}. Capabilities: {', '.join(profile.capabilities[:2])}",
+                confidence=0.5,  # 初始信念置信度较低
+                evidence_count=0,
+                last_updated=datetime.now().isoformat()
+            )
+            self.beliefs.append(initial_belief_to_new)
+
+            # New -> Existing: 基于Existing的Profile生成初始信念
+            initial_belief_from_new = RelationalBelief(
+                from_agent=profile.agent_id,
+                to_agent=existing_id,
+                belief_type='capability_assessment',
+                content=f"Experienced agent with role {existing_profile.role}. May help with {', '.join(existing_profile.specializations[:2])}",
+                confidence=0.5,
+                evidence_count=0,
+                last_updated=datetime.now().isoformat()
+            )
+            self.beliefs.append(initial_belief_from_new)
+
     def add_belief(self, belief: RelationalBelief):
-        """Add or update a relational belief"""
-        # Check if similar belief exists
-        existing = None
+        """添加或更新关系信念"""
+        # 查找是否存在相似信念
+        existing_idx = None
         for i, b in enumerate(self.beliefs):
             if (b.from_agent == belief.from_agent and
                     b.to_agent == belief.to_agent and
                     b.belief_type == belief.belief_type):
-                existing = i
+                existing_idx = i
                 break
 
-        if existing is not None:
-            # Update existing belief
-            self.beliefs[existing] = belief
+        if existing_idx is not None:
+            # 更新现有信念
+            self.beliefs[existing_idx] = belief
         else:
-            # Add new belief
+            # 添加新信念
             self.beliefs.append(belief)
 
     def get_agent_profile(self, agent_id: str) -> Optional[AgentProfile]:
-        """Retrieve agent profile"""
+        """检索Agent profile"""
         return self.profiles.get(agent_id)
 
-    def get_beliefs_about(self, to_agent: str, from_agent: Optional[str] = None) -> List[RelationalBelief]:
-        """Get all beliefs about a specific agent"""
+    def get_beliefs_about(
+        self,
+        to_agent: str,
+        from_agent: Optional[str] = None
+    ) -> List[RelationalBelief]:
+        """
+        获取关于特定Agent的信念
+        **重要**：如果指定from_agent，只返回该Agent的主观视角
+        """
         if from_agent:
             return [b for b in self.beliefs
                     if b.to_agent == to_agent and b.from_agent == from_agent]
         return [b for b in self.beliefs if b.to_agent == to_agent]
 
     def get_beliefs_from(self, from_agent: str) -> List[RelationalBelief]:
-        """Get all beliefs held by a specific agent"""
+        """获取特定Agent持有的所有信念"""
         return [b for b in self.beliefs if b.from_agent == from_agent]
 
-    def get_context_for_routing(self, current_agent: str, candidate_agents: List[str],
-                                task_description: str) -> str:
+    def get_context_for_routing(
+        self,
+        current_agent: str,
+        candidate_agents: List[str],
+        task_description: str
+    ) -> str:
         """
-        Generate rich context for LLM-based routing decision
-        This is the input to the Semantic Router
+        为LLM路由决策生成丰富的上下文
+        **关键**：只提供current_agent的主观视角
         """
         context = f"Current Task: {task_description}\n\n"
-        context += f"Current Agent: {current_agent}\n"
+        context += f"Your Perspective (as {current_agent}):\n"
 
-        # Add profiles of candidate agents
+        # 添加候选Agent的公开Profile
         context += "\nCandidate Agents:\n"
         for agent_id in candidate_agents:
             profile = self.get_agent_profile(agent_id)
             if profile:
                 context += f"\n{profile.to_text()}\n"
 
-        # Add relevant beliefs
-        context += "\nRelevant Past Interactions:\n"
+        # **关键修改**：只添加current_agent对候选者的私有信念
+        context += f"\nYour Beliefs about Candidates:\n"
         for agent_id in candidate_agents:
-            beliefs = self.get_beliefs_about(agent_id, from_agent=current_agent)
+            beliefs = self.get_beliefs_about(
+                agent_id,
+                from_agent=current_agent
+            )
             if beliefs:
-                for belief in beliefs[-3:]:  # Last 3 beliefs
-                    context += f"- {belief.to_text()}\n"
+                context += f"\nAbout {agent_id}:\n"
+                for belief in beliefs[-3:]:  # 最近3条信念
+                    context += f"- {belief.content} (confidence: {belief.confidence:.2f})\n"
 
         return context
 
     def save(self):
-        """Save registry to disk"""
+        """持久化到磁盘"""
         if self.save_path is None:
             return
 
@@ -130,11 +181,12 @@ class MindRegistry:
             'beliefs': [asdict(b) for b in self.beliefs]
         }
 
+        self.save_path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.save_path, 'w') as f:
             json.dump(data, f, indent=2)
 
     def load(self):
-        """Load registry from disk"""
+        """从磁盘加载"""
         if self.save_path is None or not self.save_path.exists():
             return
 
@@ -145,51 +197,39 @@ class MindRegistry:
         self.beliefs = [RelationalBelief(**b) for b in data['beliefs']]
 
 
-# Example usage
+# 使用示例
 if __name__ == "__main__":
-    # Create registry
     registry = MindRegistry()
 
-    # Register math solver
+    # 注册第一个Agent
     math_profile = AgentProfile(
         agent_id="math_solver_1",
         role="Math Solver",
-        capabilities=["arithmetic", "algebra", "geometry"],
-        specializations=["step-by-step reasoning", "equation solving"],
-        limitations=["struggles with very large numbers", "no symbolic computation"],
-        description="Specialized in solving mathematical problems through systematic reasoning"
+        capabilities=["arithmetic", "algebra"],
+        specializations=["step-by-step reasoning"],
+        limitations=["no symbolic computation"],
+        description="Specialized in solving math problems"
     )
     registry.register_agent(math_profile)
 
-    # Register code expert
+    # 注册第二个Agent - 自动触发互认初始化
     code_profile = AgentProfile(
         agent_id="code_expert_1",
-        role="Programming Expert",
-        capabilities=["python", "algorithm design", "debugging"],
-        specializations=["numerical computation", "data processing"],
-        limitations=["no expertise in web frameworks"],
-        description="Expert programmer capable of implementing algorithms and debugging code"
+        role="Code Expert",
+        capabilities=["python", "algorithm design"],
+        specializations=["numerical computation"],
+        limitations=["no web frameworks"],
+        description="Expert programmer for algorithms"
     )
     registry.register_agent(code_profile)
 
-    # Add a belief based on past interaction
-    belief = RelationalBelief(
-        from_agent="math_solver_1",
-        to_agent="code_expert_1",
-        belief_type="capability_assessment",
-        content="Code expert is excellent at converting mathematical formulas into executable code",
-        confidence=0.85,
-        evidence_count=5,
-        last_updated="2025-01-15"
-    )
-    registry.add_belief(belief)
+    # 查看互认初始化的结果
+    print("=== Math Solver's View of Code Expert ===")
+    beliefs = registry.get_beliefs_about("code_expert_1", from_agent="math_solver_1")
+    for b in beliefs:
+        print(b.to_text())
 
-    # Generate routing context
-    context = registry.get_context_for_routing(
-        current_agent="math_solver_1",
-        candidate_agents=["code_expert_1"],
-        task_description="Implement the quadratic formula to solve ax^2 + bx + c = 0"
-    )
-
-    print("=== Routing Context ===")
-    print(context)
+    print("\n=== Code Expert's View of Math Solver ===")
+    beliefs = registry.get_beliefs_about("math_solver_1", from_agent="code_expert_1")
+    for b in beliefs:
+        print(b.to_text())
