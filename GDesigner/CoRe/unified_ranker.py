@@ -316,7 +316,7 @@ class UnifiedRanker:
         instruction = f"""
 === ROLE SWITCH: YOU ARE NOW THE COORDINATOR ===
 
-Excellent work on the analysis above. Now, please step back and act as the **Coordinator** to decide the next step.
+Excellent work on the analysis above. Now, please act as the **Coordinator** to decide the next step.
 
 {path_summary}
 
