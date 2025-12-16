@@ -5,6 +5,12 @@ System 1.5 (Reranker) + System 2 (LLM) 混合架构
 关键设计：
 1. Reranker用于冷启动和RAG检索（直接对文本打分，无需向量库）
 2. LLM用于事后路由和见解生成（复杂推理和策略规划）
+
+v4.2 更新：
+- 移除 Confidence 字段
+- 强制 CoT (先 REASONING 再 SELECTED)
+- Insight 改为 SUGGESTION (建议性而非指令性)
+- 路由决策时注入 Agent Input Context 和 Routing History
 """
 
 import torch
@@ -18,12 +24,11 @@ import numpy as np
 
 @dataclass
 class RoutingDecision:
-    """路由决策结果"""
+    """路由决策结果 (v4.2: 移除 confidence)"""
     selected_agent: str
-    reasoning: str
-    confidence: float
+    reasoning: str  # **v4.2新增**: CoT推理过程
     path_used: str  # 'reranker_cold_start', 'llm_post_hoc'
-    insight_instruction: Optional[str]  # **v4.1新增**：策略指令
+    insight_instruction: Optional[str]  # **v4.2改名**: 原为insight，现为suggestion
     alternative_agents: List[Tuple[str, float]]
     cost_tokens: int
 
@@ -39,7 +44,7 @@ class UnifiedRanker:
 
     - System 2 (LLM):
       * 事后路由：基于当前Agent的私有视角决策下一棒
-      * 见解生成：为下一个Agent生成战略性Insight指令
+      * 见解生成：为下一个Agent生成战略性Suggestion
     """
 
     def __init__(
@@ -163,16 +168,19 @@ class UnifiedRanker:
             current_output: str,
             current_agent_id: str,
             candidate_agents: List[str],
-            context_from_registry: str  # 来自MindRegistry的上下文（包含私有信念）
+            context_from_registry: str,  # 来自MindRegistry的上下文（包含私有信念）
+            agent_input_context: Dict,  # **v4.2新增**: Agent完整输入上下文
+            routing_history: List[Dict]  # **v4.2新增**: 历史路由决策
     ) -> RoutingDecision:
         """
-        System 2: 事后路由 + 见解生成
+        System 2: 事后路由 + 见解生成 (v4.2增强)
 
         这是LLM的核心决策环节：
         1. 基于当前Agent的主观视角（私有信念）
         2. 分析Task和当前Output
-        3. 决定下一个最合适的Agent
-        4. **生成Insight指令**：告诉下一个Agent应该重点关注什么
+        3. **考虑Agent的输入上下文和路径历史**
+        4. 决定下一个最合适的Agent
+        5. **生成Suggestion**：建议性指导（非强制指令）
 
         Args:
             task: 原始任务
@@ -180,19 +188,22 @@ class UnifiedRanker:
             current_agent_id: 当前Agent的ID（视角）
             candidate_agents: 候选Agent列表
             context_from_registry: MindRegistry提供的上下文（含私有信念）
+            agent_input_context: 当前Agent的完整输入（含RAG/Insight）
+            routing_history: 历史路由路径
 
         Returns:
             RoutingDecision包含：
             - selected_agent: 下一个Agent
-            - insight_instruction: 战略性指导
-            - reasoning: 决策理由
+            - reasoning: CoT推理过程
+            - insight_instruction: 战略性建议
         """
         self.stats['post_hoc_route_count'] += 1
 
-        # 构建Prompt
+        # 构建Prompt (v4.2增强版)
         prompt = self._build_llm_route_prompt(
             task, current_output, current_agent_id,
-            candidate_agents, context_from_registry
+            candidate_agents, context_from_registry,
+            agent_input_context, routing_history
         )
 
         # 调用LLM
@@ -206,8 +217,8 @@ class UnifiedRanker:
 
         response = await self.llm.agen(messages)
 
-        # 解析响应
-        selected_agent, reasoning, confidence, insight = self._parse_llm_route_response(
+        # 解析响应 (v4.2适配CoT格式)
+        selected_agent, reasoning, suggestion = self._parse_llm_route_response(
             response, candidate_agents
         )
 
@@ -216,14 +227,13 @@ class UnifiedRanker:
         self.stats['total_tokens_used'] += token_cost
 
         print(f"[LLM Route] {current_agent_id} -> {selected_agent}")
-        # print(f"[Insight] {insight[:100]}..." if len(insight) > 100 else f"[Insight] {insight}")
+        print(f"[Reasoning] {reasoning[:100]}..." if len(reasoning) > 100 else f"[Reasoning] {reasoning}")
 
         return RoutingDecision(
             selected_agent=selected_agent,
             reasoning=reasoning,
-            confidence=confidence,
             path_used='llm_post_hoc',
-            insight_instruction=insight,
+            insight_instruction=suggestion,
             alternative_agents=[(cand, 0.0) for cand in candidate_agents if cand != selected_agent],
             cost_tokens=token_cost
         )
@@ -234,17 +244,34 @@ class UnifiedRanker:
             current_output: str,
             current_agent_id: str,
             candidate_agents: List[str],
-            context: str
+            context: str,
+            agent_input_context: Dict,
+            routing_history: List[Dict]
     ) -> str:
         """
-        构建LLM路由的Prompt
+        构建LLM路由的Prompt (v4.2重构版)
 
-        Prompt结构：
-        1. 角色设定：你是current_agent
-        2. 任务上下文：Task + 你的Output
-        3. 私有信念：你对候选者的看法（来自MindRegistry）
-        4. 指令：选择下一个Agent + 生成Insight
+        **关键改进**:
+        1. 强制CoT：先REASONING后SELECTED
+        2. Insight改为SUGGESTION（建议性）
+        3. 注入Agent Input Context和Routing History
+        4. 移除Confidence要求
         """
+
+        # === 构建Agent Input Context描述 ===
+        input_context_str = ""
+        if 'retrieved_history' in agent_input_context and agent_input_context['retrieved_history']:
+            input_context_str += f"\n**RAG Context Provided**: Yes\n"
+        if 'insight' in agent_input_context and agent_input_context['insight']:
+            input_context_str += f"**Previous Suggestion**: {agent_input_context['insight']}\n"
+
+        # === 构建Routing History描述 ===
+        history_str = ""
+        if routing_history:
+            history_str = "\n=== ROUTING PATH SO FAR ===\n"
+            for i, decision in enumerate(routing_history[-3:], 1):  # 最近3步
+                history_str += f"Step {i}: {decision.get('selected', 'Unknown')} "
+                history_str += f"(Reasoning: {decision.get('reasoning', 'N/A')[:50]}...)\n"
 
         prompt = f"""You are {current_agent_id}, coordinating a multi-agent system to solve a complex task.
 
@@ -253,6 +280,10 @@ class UnifiedRanker:
 
 === YOUR RECENT OUTPUT ===
 {current_output}
+
+{input_context_str}
+
+{history_str}
 
 === YOUR PERSPECTIVE (Private Beliefs) ===
 {context}
@@ -263,21 +294,23 @@ class UnifiedRanker:
 === YOUR DECISION ===
 Based on:
 1. The task requirements
-2. Your output so far
-3. Your beliefs about each candidate's capabilities
+2. Your output and the context you received
+3. The routing path taken so far
+4. Your beliefs about each candidate's capabilities
 
-Please:
-1. Select the MOST SUITABLE next agent
-2. Provide a STRATEGIC INSIGHT for them
-   - What specific aspect should they focus on?
-   - What pitfalls should they avoid?
-   - How can they best leverage your work?
+Please decide:
+1. **First, explain your reasoning** (analyze the situation)
+2. **Then, select the MOST SUITABLE next agent**
+3. **Finally, provide a SUGGESTION** (not a command, but advice)
+   - What aspect should they consider?
+   - What pitfalls might exist?
+   - How can they build on your work?
 
-Respond in this exact format:
+**CRITICAL**: Respond in this EXACT format (REASONING must come first):
+
+REASONING: <your step-by-step analysis of why this agent is best>
 SELECTED: <agent_id>
-REASONING: <your detailed reasoning about why this agent is the best choice>
-INSIGHT: <specific strategic instruction for the next agent, be concrete and actionable>
-CONFIDENCE: <0.0-1.0>
+SUGGESTION: <brief, actionable advice for the next agent - keep it under 50 words>
 """
         return prompt
 
@@ -285,53 +318,48 @@ CONFIDENCE: <0.0-1.0>
             self,
             response: str,
             candidate_agents: List[str]
-    ) -> Tuple[str, str, float, str]:
+    ) -> Tuple[str, str, str]:
         """
-        解析LLM路由响应
+        解析LLM路由响应 (v4.2适配CoT格式)
 
         期望格式：
-        SELECTED: agent_id
         REASONING: ...
-        INSIGHT: ...
-        CONFIDENCE: 0.0-1.0
+        SELECTED: agent_id
+        SUGGESTION: ...
 
         Returns:
-            (selected_agent, reasoning, confidence, insight)
+            (selected_agent, reasoning, suggestion)
         """
 
         lines = response.strip().split('\n')
 
         selected_agent = None
         reasoning = ""
-        insight = ""
-        confidence = 0.5
+        suggestion = ""
 
         for line in lines:
             line = line.strip()
-            if line.startswith('SELECTED:'):
-                selected_agent = line.replace('SELECTED:', '').strip()
-            elif line.startswith('REASONING:'):
+            if line.startswith('REASONING:'):
                 reasoning = line.replace('REASONING:', '').strip()
-            elif line.startswith('INSIGHT:'):
-                insight = line.replace('INSIGHT:', '').strip()
-            elif line.startswith('CONFIDENCE:'):
-                try:
-                    confidence = float(line.replace('CONFIDENCE:', '').strip())
-                    confidence = max(0.0, min(1.0, confidence))  # 限制范围
-                except:
-                    confidence = 0.5
+            elif line.startswith('SELECTED:'):
+                selected_agent = line.replace('SELECTED:', '').strip()
+            elif line.startswith('SUGGESTION:'):
+                suggestion = line.replace('SUGGESTION:', '').strip()
 
         # 容错处理
         if not selected_agent or selected_agent not in candidate_agents:
             print(f"[Warning] Invalid selection '{selected_agent}', using first candidate")
             selected_agent = candidate_agents[0]
-            reasoning = "Failed to parse LLM response, using first candidate as fallback"
-            insight = "Please continue the task based on previous context"
+            reasoning = reasoning or "Failed to parse LLM response, using first candidate as fallback"
+            suggestion = "Please continue the task using your expertise"
 
-        if not insight:
-            insight = "Continue with the task using your expertise"
+        if not suggestion:
+            suggestion = "Build on the previous work and focus on quality"
 
-        return selected_agent, reasoning, confidence, insight
+        if not reasoning:
+            reasoning = "Selection based on agent capabilities"
+
+        return selected_agent, reasoning, suggestion
 
     def get_statistics(self) -> Dict:
         """获取统计信息"""
@@ -357,14 +385,13 @@ if __name__ == "__main__":
     # Mock LLM用于测试
     class MockLLM:
         async def agen(self, messages):
-            return """SELECTED: code_expert_1
-REASONING: The task requires implementing a mathematical formula in code. While the math analysis is complete, we need someone who can translate this into robust, executable code. Code expert has proven track record in numerical implementations.
-INSIGHT: Focus on edge case handling, especially division by zero when a=0. Implement input validation before applying the formula. Consider returning None or raising a custom exception for invalid inputs.
-CONFIDENCE: 0.85"""
+            return """REASONING: The current mathematical analysis is complete and requires translation into executable code. The code expert has proven track record in numerical implementations and can handle edge cases like division by zero with proper validation.
+SELECTED: code_expert_1
+SUGGESTION: Focus on input validation before applying the formula. Consider edge cases where a=0. Return None or raise a clear exception for invalid inputs."""
 
     async def test_unified_ranker():
         print("="*70)
-        print("CoRe v4.1 - Unified Ranker Test Suite")
+        print("CoRe v4.2 - Unified Ranker Test Suite")
         print("="*70)
 
         llm = MockLLM()
@@ -373,43 +400,8 @@ CONFIDENCE: 0.85"""
             reranker_model_name="BAAI/bge-reranker-v2-m3"
         )
 
-        # ===== 测试1: 冷启动 =====
-        print("\n[TEST 1] Cold Start")
-        print("-"*70)
-
-        profiles = {
-            "math_solver_1": "Math expert specializing in algebraic problem solving and equation analysis. Strong in theoretical mathematics.",
-            "code_expert_1": "Programming expert focused on numerical algorithms and scientific computing. Proficient in Python and algorithm implementation.",
-            "analyst_1": "Strategic analyst good at breaking down complex problems and planning solution approaches."
-        }
-
-        best_agent = await ranker.cold_start(
-            task="Implement the quadratic formula to solve ax^2 + bx + c = 0",
-            profiles=profiles
-        )
-        print(f"✓ Cold Start Selected: {best_agent}")
-
-        # ===== 测试2: RAG检索 =====
-        print("\n[TEST 2] RAG Retrieval")
-        print("-"*70)
-
-        history = [
-            "Step 1: Analyzed the problem structure. This is a standard quadratic equation.",
-            "Step 2: Identified coefficients: a=2, b=5, c=-3",
-            "Step 3: Applied discriminant formula: b²-4ac = 25 - 4(2)(-3) = 49",
-            "Step 4: Since discriminant > 0, there are two real solutions",
-            "Step 5: Prepared implementation plan: use quadratic formula x = (-b ± √Δ) / (2a)"
-        ]
-
-        retrieved = ranker.retrieve(
-            task="Implement the quadratic formula in Python",
-            history_list=history,
-            top_k=3
-        )
-        print(f"✓ Retrieved Context:\n{retrieved[:200]}...")
-
-        # ===== 测试3: LLM路由 =====
-        print("\n[TEST 3] LLM Post-hoc Routing")
+        # ===== 测试: LLM路由 (v4.2) =====
+        print("\n[TEST] LLM Post-hoc Routing (v4.2)")
         print("-"*70)
 
         context_from_registry = """
@@ -418,25 +410,34 @@ Your beliefs about candidates:
 About code_expert_1:
 - Excellent at translating mathematical concepts into clean, executable code (confidence: 0.85)
 - Has successfully handled similar numerical computation tasks before (evidence: 5 interactions)
-- Sometimes overlooks edge cases without explicit reminders (confidence: 0.70)
 
 About math_solver_2:
 - Strong in theoretical proofs but less experienced in practical implementation (confidence: 0.60)
-- Good collaborator but may not be the best choice for coding tasks (evidence: 3 interactions)
 """
+
+        agent_input_context = {
+            'task': "Implement the quadratic formula",
+            'retrieved_history': "Previous analysis showed discriminant = 49",
+            'insight': "Focus on numerical stability"
+        }
+
+        routing_history = [
+            {'selected': 'math_solver_1', 'reasoning': 'Initial analysis needed'}
+        ]
 
         decision = await ranker.route_llm(
             task="Implement the quadratic formula to solve ax^2 + bx + c = 0",
-            current_output="I've completed the mathematical analysis: discriminant is 49, two real solutions expected at x = (-5 ± 7) / 4",
+            current_output="I've completed the mathematical analysis: discriminant is 49, two real solutions expected",
             current_agent_id="math_solver_1",
             candidate_agents=["code_expert_1", "math_solver_2", "decision_maker"],
-            context_from_registry=context_from_registry
+            context_from_registry=context_from_registry,
+            agent_input_context=agent_input_context,
+            routing_history=routing_history
         )
 
         print(f"✓ Selected Agent: {decision.selected_agent}")
         print(f"✓ Reasoning: {decision.reasoning[:100]}...")
-        print(f"✓ Insight Instruction: {decision.insight_instruction[:100]}...")
-        print(f"✓ Confidence: {decision.confidence:.2f}")
+        print(f"✓ Suggestion: {decision.insight_instruction}")
         print(f"✓ Token Cost: {decision.cost_tokens}")
 
         # ===== 统计信息 =====

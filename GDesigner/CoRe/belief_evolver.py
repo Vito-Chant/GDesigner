@@ -1,6 +1,10 @@
 """
-CoRe Framework v4.1: Belief Evolution Module
+CoRe Framework v4.2: Belief Evolution Module
 重点：分析路由决策质量，仅更新私有信念
+
+v4.2 更新:
+- insight_instruction 改为 suggestion (命名统一)
+- 适配移除 confidence 的路由决策格式
 """
 
 from typing import Dict, List, Tuple, Optional
@@ -11,11 +15,11 @@ from datetime import datetime
 
 @dataclass
 class InteractionTrace:
-    """完整的Agent交互记录"""
+    """完整的Agent交互记录 (v4.2更新)"""
     from_agent: str
     to_agent: str
     task: str
-    insight_instruction: str  # **修改**: 从handoff_note改为insight
+    suggestion: str  # **v4.2修改**: 从insight_instruction改为suggestion
     output: str
     success: bool
     failure_reason: Optional[str] = None
@@ -41,9 +45,9 @@ class BeliefEvolver:
     """
     在线信念进化
 
-    **v4.1关键修改**:
-    - 分析对象：从Handoff Note改为Routing Decision
-    - 评估重点：Sender给出的Insight指令是否误导了Receiver？
+    **v4.2关键修改**:
+    - 分析对象：Routing Decision (不再依赖 Confidence)
+    - 评估重点：Sender的Suggestion是否有效？
     - 更新范围：严格限制为私有信念（Sender -> Receiver）
     """
 
@@ -62,9 +66,9 @@ class BeliefEvolver:
         """
         基于交互结果更新信念
 
-        **v4.1核心逻辑**:
-        分析Sender的Insight指令质量：
-        - 是否误导了Receiver？
+        **v4.2核心逻辑**:
+        分析Sender的Suggestion质量：
+        - 是否有效指导了Receiver？
         - 还是Receiver能力确实不行？
         """
 
@@ -108,7 +112,7 @@ class BeliefEvolver:
 From: {trace.from_agent}
 To: {trace.to_agent}
 Task: {trace.task}
-Insight Instruction Given: {trace.insight_instruction}
+Suggestion Given: {trace.suggestion}
 Outcome: SUCCESS
 
 Existing beliefs: {[b.content for b in existing_beliefs] if existing_beliefs else 'None'}
@@ -151,10 +155,10 @@ Format: BELIEF: <statement>"""
             feedback: Optional[str]
     ) -> List[BeliefUpdate]:
         """
-        失败归因
+        失败归因 (v4.2更新)
 
-        **v4.1关键问题**:
-        是Sender的Insight指令有问题？还是Receiver能力不足？
+        **v4.2关键问题**:
+        是Sender的Suggestion有问题？还是Receiver能力不足？
         """
 
         prompt = f"""An agent handoff FAILED. Analyze the ROOT CAUSE:
@@ -162,7 +166,7 @@ Format: BELIEF: <statement>"""
 FAILED INTERACTION:
 From: {trace.from_agent} → To: {trace.to_agent}
 Task: {trace.task}
-Insight Instruction: {trace.insight_instruction}
+Suggestion Given: {trace.suggestion}
 Output: {trace.output}
 Failure Reason: {trace.failure_reason}
 
@@ -174,24 +178,23 @@ FULL CHAIN (for context):
         if feedback:
             prompt += f"\nCritic Feedback: {feedback}"
 
-        prompt += """
+        prompt += f"""
 
 CRITICAL ANALYSIS TASK:
-1. Was the Insight Instruction from {from_agent} MISLEADING or INAPPROPRIATE?
-   - Did it guide {to_agent} in the wrong direction?
+1. Was the Suggestion from {trace.from_agent} MISLEADING or INAPPROPRIATE?
+   - Did it guide {trace.to_agent} in the wrong direction?
    - Was it too vague or too specific?
 
-2. OR was {to_agent} simply INCAPABLE of executing the task?
+2. OR was {trace.to_agent} simply INCAPABLE of executing the task?
    - Did they lack the necessary skills?
-   - Did they make obvious mistakes unrelated to the instruction?
+   - Did they make obvious mistakes unrelated to the suggestion?
 
-3. What belief should {from_agent} update about {to_agent}?
+3. What belief should {trace.from_agent} update about {trace.to_agent}?
 
 Respond in this format:
-ROOT_CAUSE: <misleading_instruction|agent_capability|both>
-BELIEF_UPDATE: <new belief statement about {to_agent}'s capabilities>
-STRATEGY_CHANGE: <what should change in future routing and instruction-giving>
-CONFIDENCE: <0.0-1.0>
+ROOT_CAUSE: <misleading_suggestion|agent_capability|both>
+BELIEF_UPDATE: <new belief statement about {trace.to_agent}'s capabilities>
+STRATEGY_CHANGE: <what should change in future routing and suggestion-giving>
 """
 
         messages = [
@@ -201,7 +204,7 @@ CONFIDENCE: <0.0-1.0>
 
         response = await self.llm.agen(messages)
 
-        root_cause, belief_update, strategy_change, confidence = self._parse_failure_analysis(response)
+        root_cause, belief_update, strategy_change = self._parse_failure_analysis(response)
 
         updates = []
 
@@ -231,7 +234,7 @@ CONFIDENCE: <0.0-1.0>
 This step: {trace.from_agent} → {trace.to_agent}
 Local success: {trace.success}
 Global task success: {task_success}
-Insight Given: {trace.insight_instruction}
+Suggestion Given: {trace.suggestion}
 
 Generate a NUANCED belief update that captures the complexity.
 For example: "Good at X when given specific guidance, but struggles with Y"
@@ -300,13 +303,12 @@ Format: BELIEF: <nuanced statement>"""
 
         return "Capability assessment updated based on interaction"
 
-    def _parse_failure_analysis(self, response: str) -> Tuple[str, str, str, float]:
-        """解析失败分析响应"""
+    def _parse_failure_analysis(self, response: str) -> Tuple[str, str, str]:
+        """解析失败分析响应 (v4.2: 移除confidence返回)"""
 
         root_cause = "unknown"
         belief_update = "Performance below expectations"
-        strategy_change = "Consider alternative agents or clearer instructions"
-        confidence = 0.3
+        strategy_change = "Consider alternative agents or clearer suggestions"
 
         for line in response.split('\n'):
             line = line.strip()
@@ -316,13 +318,8 @@ Format: BELIEF: <nuanced statement>"""
                 belief_update = line.replace('BELIEF_UPDATE:', '').strip()
             elif line.startswith('STRATEGY_CHANGE:'):
                 strategy_change = line.replace('STRATEGY_CHANGE:', '').strip()
-            elif line.startswith('CONFIDENCE:'):
-                try:
-                    confidence = float(line.replace('CONFIDENCE:', '').strip())
-                except:
-                    pass
 
-        return root_cause, belief_update, strategy_change, confidence
+        return root_cause, belief_update, strategy_change
 
     def get_evolution_summary(self) -> Dict:
         """获取信念进化摘要"""
@@ -347,9 +344,8 @@ if __name__ == "__main__":
                 return "BELIEF: Excellent at following strategic guidance for implementation tasks"
             else:
                 return """ROOT_CAUSE: agent_capability
-BELIEF_UPDATE: Struggles with edge cases despite clear instructions
-STRATEGY_CHANGE: Provide more detailed examples in future insights
-CONFIDENCE: 0.4"""
+BELIEF_UPDATE: Struggles with edge cases despite clear suggestions
+STRATEGY_CHANGE: Provide more detailed examples in future suggestions"""
 
     async def test_evolution():
         llm = MockLLM()
@@ -371,7 +367,7 @@ CONFIDENCE: 0.4"""
             from_agent="math_solver_1",
             to_agent="code_expert_1",
             task="Implement quadratic formula",
-            insight_instruction="Focus on handling edge cases like division by zero",
+            suggestion="Focus on handling edge cases like division by zero",
             output="def solve(a,b,c): return (-b)/(2*a) if a != 0 else None",
             success=True
         )
@@ -390,7 +386,7 @@ CONFIDENCE: 0.4"""
             from_agent="math_solver_1",
             to_agent="code_expert_1",
             task="Handle division by zero",
-            insight_instruction="Add comprehensive error handling",
+            suggestion="Add comprehensive error handling",
             output="def solve(a,b,c): return (-b)/(2*a)  # Still no validation!",
             success=False,
             failure_reason="Division by zero when a=0"
