@@ -253,7 +253,7 @@ async def test_core_graph_on_mmlu(
             input_dict = dataset.record_to_input(record)
 
             batch_tasks.append(
-                core_graph.run_cognitive_relay(input_dict, num_rounds=num_rounds)
+                core_graph.run_cognitive_relay(input_dict)
             )
             batch_records.append(record)
 

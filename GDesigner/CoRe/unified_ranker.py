@@ -52,7 +52,7 @@ class UnifiedRanker:
             llm,
             reranker_model_name: str = "BAAI/bge-reranker-v2-m3",
             max_loop_count: int = 2,
-            decision_maker_id: str = "final_refer"  # **v4.3.2新增**
+            decision_maker_id: str = "final_decision"  # **v4.3.2新增**
     ):
         """初始化Unified Ranker"""
         self.llm = llm
@@ -336,7 +336,7 @@ Excellent work on the analysis above. Now, please step back and act as the **Coo
 
 **CRITICAL DECISION CRITERIA**:
 1. **If the task is FULLY SOLVED and no more analysis is needed:**
-   - Select the Decision Maker: `{decision_maker if decision_maker else 'final_refer'}`
+   - Select the Decision Maker: `{decision_maker if decision_maker else 'final_decision'}`
    - This will END the routing chain and produce the final answer
 
 2. **If the task needs MORE work (new perspective, verification, implementation):**
@@ -425,7 +425,7 @@ SUGGESTION: <brief, actionable advice - under 50 words>
 === CANDIDATE AGENTS ===
 {', '.join(candidate_agents)}
 
-**Decision Maker**: `{decision_maker if decision_maker else 'final_refer'}` - Select this to END the chain
+**Decision Maker**: `{decision_maker if decision_maker else 'final_decision'}` - Select this to END the chain
 
 === YOUR DECISION ===
 **CRITICAL**: 

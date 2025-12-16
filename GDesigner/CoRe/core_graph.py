@@ -83,7 +83,8 @@ class CoReGraph:
         self.decision_maker = AgentRegistry.get(
             decision_method,
             domain=domain,
-            llm_name=llm_name
+            llm_name=llm_name,
+            id="final_decision"
         )
 
         # **v4.3.2: 传递 Decision Maker ID 到 Ranker**
