@@ -10,6 +10,8 @@ System 1.5 (Reranker) + System 2 (LLM) 混合架构
 import torch
 from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
+
+import weave
 from sentence_transformers import CrossEncoder
 import numpy as np
 
@@ -154,6 +156,7 @@ class UnifiedRanker:
         # 用分隔符拼接
         return "\n\n---\n\n".join(retrieved_texts)
 
+    @weave.op()
     async def route_llm(
             self,
             task: str,

@@ -325,7 +325,7 @@ class CoReGraph:
         elif self.domain == "humaneval":
             agent_class = "CodeWriting"
         elif self.domain == "mmlu":
-            agent_class = "AnalyzeAgent"
+            agent_class = "CoReAnalyzeAgent"
         else:
             agent_class = "MathSolver"
 
@@ -338,6 +338,7 @@ class CoReGraph:
 
         return agent
 
+    @weave.op()
     async def _execute_agent(self, agent, input_dict: Dict) -> str:
         """执行Agent并返回输出"""
 
@@ -388,15 +389,17 @@ if __name__ == "__main__":
         project_name='vito_chan/G-Designer',
     )
 
+
     async def test_core():
         core = CoReGraph(
-            domain="gsm8k",
+            domain="mmlu",
             llm_name="Qwen/Qwen3-4B-Instruct-2507",
             available_roles=[
-                "Math Solver",
-                "Mathematical Analyst",
-                "Programming Expert",
-                "Inspector"
+                'Knowlegable Expert',
+                'Critic',
+                'Mathematician',
+                'Psychologist',
+                'Historian',
             ],
             max_routing=5
         )

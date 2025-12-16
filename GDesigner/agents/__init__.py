@@ -5,6 +5,8 @@ from GDesigner.agents.adversarial_agent import AdverarialAgent
 from GDesigner.agents.final_decision import FinalRefer,FinalDirect,FinalWriteCode,FinalMajorVote
 from GDesigner.agents.agent_registry import AgentRegistry
 
+from GDesigner.agents.core_analyze_agent import AnalyzeAgent as CoReAnalyzeAgent
+
 __all__ =  ['AnalyzeAgent',
             'CodeWriting',
             'MathSolver',
@@ -14,4 +16,6 @@ __all__ =  ['AnalyzeAgent',
             'FinalWriteCode',
             'FinalMajorVote',
             'AgentRegistry',
+
+            'CoReAnalyzeAgent'
            ]

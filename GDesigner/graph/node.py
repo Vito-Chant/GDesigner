@@ -65,12 +65,12 @@ class Node(ABC):
         self.raw_inputs: List[Any] = []
         self.role = ""
         self.last_memory: Dict[str, List[Any]] = {'inputs': [], 'outputs': [], 'raw_inputs': []}
-        if shared_adapter:
-            self.adapter = shared_adapter
-        else:
-            self.adapter = ActionAdapter(llm_name=llm_name)
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.adapter.to(device=device)
+        # if shared_adapter:
+        #     self.adapter = shared_adapter
+        # else:
+        #     self.adapter = ActionAdapter(llm_name=llm_name)
+        # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # self.adapter.to(device=device)
 
     @property
     def node_name(self):
