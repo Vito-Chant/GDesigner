@@ -119,8 +119,19 @@ class Node(ABC):
 
     def execute(self, input: Any, **kwargs):
         self.outputs = []
-        spatial_info: Dict[str, Dict] = self.get_spatial_info()
-        temporal_info: Dict[str, Dict] = self.get_temporal_info()
+
+        # [Fix] 优先使用外部传入的 spatial_info，避免重复传参
+        if 'spatial_info' in kwargs:
+            spatial_info = kwargs.pop('spatial_info')
+        else:
+            spatial_info: Dict[str, Dict] = self.get_spatial_info()
+
+        # [Fix] 优先使用外部传入的 temporal_info
+        if 'temporal_info' in kwargs:
+            temporal_info = kwargs.pop('temporal_info')
+        else:
+            temporal_info: Dict[str, Dict] = self.get_temporal_info()
+
         results = [self._execute(input, spatial_info, temporal_info, **kwargs)]
 
         for result in results:
@@ -131,19 +142,21 @@ class Node(ABC):
 
     async def async_execute(self, input: Any, **kwargs) -> Union[List[Any], Tuple[List[Any], Any]]:
         """
-        异步执行节点 (v4.3 KV Cache 兼容版)
-
-        **返回值兼容性**:
-        - 如果子类的 _async_execute 返回 str: 返回 [str]
-        - 如果子类的 _async_execute 返回 (str, messages): 返回 ([str], messages)
-
-        Returns:
-            - List[Any]: 传统模式（向后兼容）
-            - Tuple[List[Any], Any]: KV Cache 模式 (outputs, extra_data)
+        异步执行节点 (v4.3 KV Cache 兼容版 & 参数传递修复)
         """
         self.outputs = []
-        spatial_info: Dict[str, Any] = self.get_spatial_info()
-        temporal_info: Dict[str, Any] = self.get_temporal_info()
+
+        # [Fix] 优先检查 kwargs 中是否已包含 spatial_info，并将其 pop 出来防止冲突
+        if 'spatial_info' in kwargs:
+            spatial_info = kwargs.pop('spatial_info')
+        else:
+            spatial_info: Dict[str, Any] = self.get_spatial_info()
+
+        # [Fix] 优先检查 kwargs 中是否已包含 temporal_info
+        if 'temporal_info' in kwargs:
+            temporal_info = kwargs.pop('temporal_info')
+        else:
+            temporal_info: Dict[str, Any] = self.get_temporal_info()
 
         # 创建异步任务
         tasks = [asyncio.create_task(self._async_execute(input, spatial_info, temporal_info, **kwargs))]

@@ -138,36 +138,52 @@ class MindRegistry:
         return [b for b in self.beliefs if b.from_agent == from_agent]
 
     def get_context_for_routing(
-        self,
-        current_agent: str,
-        candidate_agents: List[str],
-        task_description: str
+            self,
+            current_agent: str,
+            candidate_agents: List[str],
+            task_description: str  # 保留参数以兼容调用，但不使用
     ) -> str:
         """
         为LLM路由决策生成丰富的上下文
-        **关键**：只提供current_agent的主观视角
-        """
-        context = f"Current Task: {task_description}\n\n"
-        context += f"Your Perspective (as {current_agent}):\n"
 
-        # 添加候选Agent的公开Profile
-        context += "\nCandidate Agents:\n"
+        **v4.3.2 关键修改**:
+        - 移除 Task 描述（由 Ranker 统一管理）
+        - 聚焦于 Agent Profiles 和 Beliefs
+        - 减少与 Ranker Prompt 的冗余
+        """
+
+        # ✅ 修改前: context = f"Current Task: {task_description}\n\n"
+        # ✅ 修改后: 不包含 Task
+        context = f"**Your Perspective (as {current_agent}):**\n\n"
+
+        # === 1. 添加候选 Agent 的 Profile（精简格式）===
+        context += "**Candidate Agent Profiles:**\n"
         for agent_id in candidate_agents:
             profile = self.get_agent_profile(agent_id)
             if profile:
-                context += f"\n{profile.to_text()}\n"
+                # ✅ 精简格式：只列出关键信息
+                context += f"\n• **{agent_id}** ({profile.role}):\n"
+                context += f"  Capabilities: {', '.join(profile.capabilities[:3])}\n"
+                if profile.specializations:
+                    context += f"  Specializes in: {', '.join(profile.specializations[:2])}\n"
 
-        # **关键修改**：只添加current_agent对候选者的私有信念
-        context += f"\nYour Beliefs about Candidates:\n"
+        # === 2. 添加私有信念（保持详细）===
+        context += f"\n\n**Your Private Beliefs about Candidates:**\n"
         for agent_id in candidate_agents:
             beliefs = self.get_beliefs_about(
                 agent_id,
                 from_agent=current_agent
             )
             if beliefs:
-                context += f"\nAbout {agent_id}:\n"
-                for belief in beliefs[-3:]:  # 最近3条信念
-                    context += f"- {belief.content} (confidence: {belief.confidence:.2f})\n"
+                context += f"\n• About **{agent_id}**:\n"
+                for belief in beliefs[-3:]:  # 最近3条
+                    context += (
+                        f"  - {belief.content} "
+                        f"(confidence: {belief.confidence:.2f}, "
+                        f"evidence: {belief.evidence_count})\n"
+                    )
+            else:
+                context += f"\n• About **{agent_id}**: No prior interactions\n"
 
         return context
 

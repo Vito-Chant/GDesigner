@@ -1,11 +1,13 @@
 """
-CoRe Framework v4.3.2: Unified Ranker Module - 修复终止逻辑
+CoRe Framework v4.3.2: Unified Ranker Module - 修复终止逻辑 & 增强失败检测
 System 1.5 (Reranker) + System 2 (LLM with Path Awareness + Proper Termination)
 
 v4.3.2 关键修复:
 - 正确处理 LLM 希望终止的情况
 - 明确告知 LLM 如何触发 Decision Maker
 - 改进错误处理和降级逻辑
+- 增强 Agent 失败/求助信号的检测
+- 优化 Prompt 结构与历史格式
 """
 
 import torch
@@ -16,6 +18,9 @@ from collections import Counter
 import weave
 from sentence_transformers import CrossEncoder
 import numpy as np
+from transformers import AutoTokenizer
+import math
+import requests
 
 
 @dataclass
@@ -29,6 +34,116 @@ class RoutingDecision:
     cost_tokens: int
     kv_cache_used: bool
     loop_detected: bool
+
+
+class QwenRerankerClient:
+    """
+    Qwen3-Reranker vLLM 客户端
+    模拟 CrossEncoder 的接口，通过 HTTP 调用 vLLM Server
+    """
+
+    def __init__(self, base_url: str, model_name: str = "Qwen/Qwen3-Reranker-0.6B", api_key: str = "EMPTY"):
+        self.base_url = base_url.rstrip("/")
+        self.model_name = model_name
+        self.api_key = api_key
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+
+        # 预计算 token IDs
+        self.true_token_id = self.tokenizer("yes", add_special_tokens=False).input_ids[0]
+        self.false_token_id = self.tokenizer("no", add_special_tokens=False).input_ids[0]
+
+        # 强制跳过思考的后缀
+        suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        self.suffix_tokens = self.tokenizer.encode(suffix, add_special_tokens=False)
+        self.max_length = 16384
+
+        # 默认指令 (Web Search fallback)
+        self.default_instruction = 'Given a web search query, retrieve relevant passages that answer the query'
+
+    def format_instruction(self, query: str, doc: str, instruction: Optional[str] = None) -> List[Dict]:
+        """构建 Prompt，支持自定义 Instruction"""
+        instruct_content = instruction if instruction else self.default_instruction
+
+        return [
+            {"role": "system",
+             "content": "Judge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be \"yes\" or \"no\"."},
+            {"role": "user", "content": f"<Instruct>: {instruct_content}\n\n<Query>: {query}\n\n<Document>: {doc}"}
+        ]
+
+    def predict(self, pairs: List[Tuple[str, str]], instruction: Optional[str] = None) -> np.ndarray:
+        """
+        批量计算 (Query, Document) 对的分数
+        Args:
+            pairs: List of (query, document) tuples
+            instruction: Custom instruction for the task (Optional)
+        """
+        if not pairs:
+            return np.array([])
+
+        # 1. 构建 Prompt (应用 Chat Template 并添加后缀)
+        prompts = []
+        for query, doc in pairs:
+            # 传入自定义 instruction
+            messages = self.format_instruction(query, doc, instruction)
+
+            # 使用 tokenizer 应用模板
+            prompt_token_ids = self.tokenizer.apply_chat_template(
+                messages, tokenize=True, add_generation_prompt=False, enable_thinking=False
+            )
+            # 截断并添加后缀 (Force Output)
+            final_token_ids = prompt_token_ids[:self.max_length - len(self.suffix_tokens)] + self.suffix_tokens
+            prompts.append(final_token_ids)
+
+        # 2. 调用 vLLM Completions API
+        payload = {
+            "model": self.model_name,
+            "prompt": prompts,
+            "max_tokens": 1,
+            "temperature": 0,
+            "logprobs": 20,
+            "echo": False
+        }
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+
+        try:
+            response = requests.post(f"{self.base_url}/v1/completions", json=payload, headers=headers)
+            response.raise_for_status()
+            results = response.json()['choices']
+
+            results.sort(key=lambda x: x['index'])
+
+            scores = []
+            for res in results:
+                logprobs = res['logprobs']['top_logprobs'][0]
+
+                true_logit = -10.0
+                false_logit = -10.0
+
+                for token_str, logprob in logprobs.items():
+                    if token_str.strip().lower() == "yes":
+                        true_logit = logprob
+                    elif token_str.strip().lower() == "no":
+                        false_logit = logprob
+
+                true_score = math.exp(true_logit)
+                false_score = math.exp(false_logit)
+
+                if true_score + false_score == 0:
+                    score = 0.0
+                else:
+                    score = true_score / (true_score + false_score)
+
+                scores.append(score)
+
+            return np.array(scores)
+
+        except Exception as e:
+            print(f"Error calling vLLM Reranker: {e}")
+            return np.zeros(len(pairs))
 
 
 class UnifiedRanker:
@@ -45,22 +160,32 @@ class UnifiedRanker:
       * **正确终止**: 明确引导 LLM 选择 Decision Maker
       * 循环检测: 防止 Agent 死循环
       * 见解生成: 生成战略性Suggestion
+      * **失败检测**: 识别 Agent 的求助信号，防止错误终止
     """
 
     def __init__(
             self,
             llm,
-            reranker_model_name: str = "BAAI/bge-reranker-v2-m3",
+            # reranker_model_name: str = "BAAI/bge-reranker-v2-m3",
+            reranker_model_name: str = "Qwen/Qwen3-Reranker-0.6B",
             max_loop_count: int = 2,
-            decision_maker_id: str = "final_decision"  # **v4.3.2新增**
+            decision_maker_id: str = "final_decision",
+            reranker_api_url: str = "http://localhost:8001"
     ):
         """初始化Unified Ranker"""
         self.llm = llm
         self.max_loop_count = max_loop_count
-        self.decision_maker_id = decision_maker_id  # **v4.3.2: 记录 Decision Maker ID**
+        self.decision_maker_id = decision_maker_id
+        self.reranker_model_name = reranker_model_name
 
-        print(f"Loading Cross-Encoder: {reranker_model_name}")
-        self.reranker = CrossEncoder(reranker_model_name)
+        # print(f"Loading Cross-Encoder: {reranker_model_name}")
+        if "Qwen" in reranker_model_name:
+            self.reranker = QwenRerankerClient(
+                base_url=reranker_api_url,
+                model_name=reranker_model_name
+            )
+        else:
+            self.reranker = CrossEncoder(reranker_model_name)
 
         self.stats = {
             'cold_start_count': 0,
@@ -68,7 +193,7 @@ class UnifiedRanker:
             'post_hoc_route_count': 0,
             'kv_cache_hits': 0,
             'loop_detections': 0,
-            'termination_attempts': 0,  # **v4.3.2新增**
+            'termination_attempts': 0,
             'total_tokens_used': 0
         }
 
@@ -85,13 +210,19 @@ class UnifiedRanker:
 
         agent_ids = list(profiles.keys())
         pairs = [(task, profiles[agent_id]) for agent_id in agent_ids]
-        scores = self.reranker.predict(pairs)
+
+        if "Qwen" in self.reranker_model_name:
+            cold_start_instruction = "Given a task description, retrieve the agent profile that has the most relevant capabilities and expertise to solve it."
+            scores = self.reranker.predict(pairs, instruction=cold_start_instruction)
+        else:
+            scores = self.reranker.predict(pairs)
         best_idx = np.argmax(scores)
         selected_agent = agent_ids[best_idx]
 
         print(f"[Cold Start] Selected {selected_agent} with score {scores[best_idx]:.3f}")
 
         return selected_agent
+
 
     def retrieve(
             self,
@@ -106,7 +237,12 @@ class UnifiedRanker:
         self.stats['rag_retrieval_count'] += 1
 
         pairs = [(task, history_item) for history_item in history_list]
-        scores = self.reranker.predict(pairs)
+
+        if "Qwen" in self.reranker_model_name:
+            rag_instruction = "Given a problem-solving task, retrieve relevant historical outputs or intermediate results that provide useful context for the next step."
+            scores = self.reranker.predict(pairs, instruction=rag_instruction)
+        else:
+            scores = self.reranker.predict(pairs)
         top_k = min(top_k, len(history_list))
         top_indices = np.argsort(scores)[-top_k:][::-1]
         retrieved_texts = [history_list[i] for i in top_indices]
@@ -114,6 +250,7 @@ class UnifiedRanker:
         print(f"[RAG] Retrieved {top_k} items from {len(history_list)} history entries")
 
         return "\n\n---\n\n".join(retrieved_texts)
+
 
     def _detect_loop(
             self,
@@ -149,6 +286,7 @@ class UnifiedRanker:
 
         return False, ""
 
+
     @weave.op()
     async def route_llm(
             self,
@@ -163,11 +301,6 @@ class UnifiedRanker:
     ) -> RoutingDecision:
         """
         System 2: 事后路由 (v4.3.2 修复终止逻辑版)
-
-        **v4.3.2 核心改进**:
-        1. 明确告知 LLM Decision Maker 的名称和作用
-        2. 改进解析逻辑，正确处理终止意图
-        3. 增强错误处理和降级策略
         """
         self.stats['post_hoc_route_count'] += 1
 
@@ -179,7 +312,7 @@ class UnifiedRanker:
                 loop_warnings[candidate] = warning
                 print(warning)
 
-        # **Step 2: 构建增强的路由指令（v4.3.2: 明确 Decision Maker）**
+        # **Step 2: 构建增强的路由指令**
         routing_instruction = self._build_enhanced_routing_instruction(
             task, current_output, current_agent_id,
             candidate_agents, context_from_registry,
@@ -211,7 +344,7 @@ class UnifiedRanker:
         # **Step 4: 调用LLM**
         response = await self.llm.agen(messages)
 
-        # **Step 5: 解析响应（v4.3.2: 改进解析逻辑）**
+        # **Step 5: 解析响应（v4.3.2: 改进解析逻辑，包含失败检测）**
         selected_agent, reasoning, suggestion, termination_requested = self._parse_llm_route_response_v2(
             response, candidate_agents
         )
@@ -252,6 +385,7 @@ class UnifiedRanker:
             loop_detected=is_loop
         )
 
+
     def _build_enhanced_routing_instruction(
             self,
             task: str,
@@ -264,27 +398,30 @@ class UnifiedRanker:
             loop_warnings: Dict[str, str]
     ) -> str:
         """
-        构建增强的路由指令 (v4.3.2: 明确终止机制)
+        构建增强的路由指令 (v4.3.2: 明确终止机制与Prompt优化)
         """
 
-        # === 1. 构建详细的路径历史 ===
-        if routing_history:
-            path_summary = "\n=== DETAILED ROUTING PATH ===\n"
-            path_summary += f"Step 0 (Cold Start): → {routing_history[0].get('selected', 'Unknown')}\n"
-
+        # === 1. 构建详细的路径历史（统一格式）===
+        path_summary = "\n=== ROUTING HISTORY ===\n"
+        if not routing_history:
+            path_summary += (
+                f"Step 0 (Cold Start): Selected {current_agent_id}\n"
+                f"  Reason: Initial selection by system\n"
+                f"  Suggestion: Analyze task\n"
+                f"\nYou are at Step 1 (Current): {current_agent_id}\n"
+            )
+        else:
+            path_summary += f"Step 0 (Cold Start): Selected {routing_history[0].get('selected', 'Unknown')}\n"
             for i, decision in enumerate(routing_history, 1):
                 selected = decision.get('selected', 'Unknown')
                 reasoning = decision.get('reasoning', 'N/A')
                 suggestion = decision.get('suggestion', 'N/A')
-
                 path_summary += f"\nStep {i}: → {selected}\n"
                 path_summary += f"  Reasoning: {reasoning[:100]}{'...' if len(reasoning) > 100 else ''}\n"
                 path_summary += f"  Suggestion: {suggestion[:80]}{'...' if len(suggestion) > 80 else ''}\n"
 
-            path_summary += f"\nStep {len(routing_history) + 1} (Current): You are {current_agent_id}\n"
-            path_summary += "=== END OF PATH ===\n"
-        else:
-            path_summary = f"\n=== ROUTING PATH ===\nThis is Step 1 right after cold start.\nYou are the first agent: {current_agent_id}\n=== END OF PATH ===\n"
+            path_summary += f"\nCurrent Step {len(routing_history) + 1}: You are {current_agent_id}\n"
+        path_summary += "=== END OF HISTORY ===\n"
 
         # === 2. 构建循环警告 ===
         loop_warning_str = ""
@@ -295,7 +432,7 @@ class UnifiedRanker:
             loop_warning_str += "Please AVOID selecting agents with loop warnings unless absolutely necessary.\n"
             loop_warning_str += "=== END OF WARNINGS ===\n"
 
-        # === 3. 识别 Decision Maker ===
+        # === 3. 识别与构建候选列表（精简格式）===
         decision_maker = None
         regular_agents = []
         for agent in candidate_agents:
@@ -304,59 +441,77 @@ class UnifiedRanker:
             else:
                 regular_agents.append(agent)
 
-        # === 4. 构建候选信息（v4.3.2: 明确 Decision Maker）===
-        candidates_info = ""
+        candidates_info = "\n**Available Candidates**:\n"
         if regular_agents:
-            candidates_info += f"\n**Regular Agents** (for continued analysis): {', '.join(regular_agents)}\n"
+            candidates_info += "  Regular Agents (for continued work):\n"
+            for agent in regular_agents:
+                candidates_info += f"    - {agent}\n"
+
         if decision_maker:
-            candidates_info += f"\n**Decision Maker** (to END the chain): `{decision_maker}`\n"
-            candidates_info += "  → Select this when the task is fully resolved and you want to produce the final answer.\n"
+            candidates_info += f"\n  **Decision Maker** (to END the chain):\n"
+            candidates_info += f"    - `{decision_maker}` → Select ONLY when task is FULLY resolved\n"
 
-        # === 5. 组装完整指令（v4.3.2: 强化终止指引）===
+        candidates_info += "\n  (Note: Detailed profiles for these agents are in 'YOUR BELIEFS' above)\n"
+
+        # === 4. 组装完整指令（优化结构）===
         instruction = f"""
-=== ROLE SWITCH: YOU ARE NOW THE COORDINATOR ===
-
-Excellent work on the analysis above. Now, please act as the **Coordinator** to decide the next step.
-
-{path_summary}
-
-**IMPORTANT: Path Analysis**
-- Review the ENTIRE routing path above
-- Identify patterns: Are we making progress or circling?
-- Consider what each agent has already contributed
-- Avoid selecting agents that would create loops or redundancy
-
-{loop_warning_str}
-
-**Your Beliefs About Candidates**:
-{context}
-
-**Available Candidates**:
-{candidates_info}
-
-**CRITICAL DECISION CRITERIA**:
-1. **If the task is FULLY SOLVED and no more analysis is needed:**
-   - Select the Decision Maker: `{decision_maker if decision_maker else 'final_decision'}`
-   - This will END the routing chain and produce the final answer
-
-2. **If the task needs MORE work (new perspective, verification, implementation):**
-   - Select an appropriate regular agent
-   - Provide a clear suggestion for what they should focus on
-
-3. **NEVER select "none" or invalid names** - always choose from the list above
-
-**Decision Format** (MUST follow exactly):
-REASONING: <detailed analysis: Is task complete? What's missing? Loop risks?>
-SELECTED: <exact agent name from the list above>
-SUGGESTION: <brief, actionable advice - under 50 words>
-
-**Remember**: 
-- The routing path is CRUCIAL - don't ignore it!
-- If the task is solved, SELECT THE DECISION MAKER to end the chain
-- Only continue routing if NEW value can be added
-- Use the EXACT agent names from the candidate list
-"""
+    === ROLE SWITCH: YOU ARE NOW THE COORDINATOR ===
+    
+    Excellent work on the analysis above. Now, please act as the **Coordinator** to decide the next step.
+    
+    {path_summary}
+    
+    **IMPORTANT: Path Analysis**
+    - Review the ENTIRE routing path above
+    - Identify patterns: Are we making progress or circling?
+    - Consider what each agent has already contributed
+    
+    {loop_warning_str}
+    
+    === YOUR BELIEFS & KNOWLEDGE (from Mind Registry) ===
+    {context}
+    
+    {candidates_info}
+    
+    **CRITICAL DECISION CRITERIA**:
+    
+    1. **CHECK FOR FAILURE/PARTIAL SUCCESS (HIGHEST PRIORITY):**
+       ⚠️ If the current agent's output indicates ANY of the following:
+       - Explicitly stated inability to complete the task
+       - Mentioned missing information or capabilities
+       - Asked for help or suggested another agent should handle it
+       - Only completed part of the work
+       - Contains phrases like "I cannot...", "I need...", "This requires...", "Unable to..."
+       
+       → **DO NOT select the Decision Maker**
+       → **SELECT a different agent** who can address the specific issue
+       → Provide clear guidance on what that agent should focus on
+    
+    2. **If the task is FULLY SOLVED and no more analysis is needed:**
+       - All requirements are met
+       - No agent has flagged issues or requested help
+       - Output is complete and validated
+       - Select the Decision Maker: `{decision_maker if decision_maker else 'final_decision'}`
+       - This will END the routing chain
+    
+    3. **If the task needs MORE work (new perspective, verification, implementation):**
+       - Select an appropriate regular agent
+       - Provide a clear suggestion for what they should focus on
+    
+    4. **NEVER select "none" or invalid names** - always choose from the list above
+    
+    **Decision Format** (MUST follow exactly):
+    REASONING: <detailed analysis: Is task complete? Any failure signals? Loop risks?>
+    SELECTED: <exact agent name from the list above>
+    SUGGESTION: <brief, actionable advice - under 50 words>
+    
+    **Remember**: 
+    - **PRIORITY 1**: Check for failure/partial completion signals
+    - The routing path is CRUCIAL - don't ignore it!
+    - Only select Decision Maker when task is FULLY resolved
+    """
         return instruction
+
 
     def _build_fallback_prompt(
             self,
@@ -370,78 +525,53 @@ SUGGESTION: <brief, actionable advice - under 50 words>
             loop_warnings: Dict[str, str]
     ) -> str:
         """
-        降级方案：构建完整 Prompt (v4.3.2: 包含终止指引)
+        降级方案：构建完整 Prompt (v4.3.2: 结构同步更新)
         """
+        # 简化版逻辑复用 instruction 构建的思路
 
-        # 详细路径历史
+        history_str = "\n=== ROUTING HISTORY ===\n"
         if routing_history:
-            history_str = "\n=== COMPLETE ROUTING PATH ===\n"
-            history_str += f"Step 0 (Cold Start): → {routing_history[0].get('selected', 'Unknown')}\n"
-
+            history_str += f"Step 0 (Cold Start): {routing_history[0].get('selected', 'Unknown')}\n"
             for i, decision in enumerate(routing_history, 1):
-                selected = decision.get('selected', 'Unknown')
-                reasoning = decision.get('reasoning', 'N/A')
-                suggestion = decision.get('suggestion', 'N/A')
-
-                history_str += f"\nStep {i}: → {selected}\n"
-                history_str += f"  Why: {reasoning[:150]}{'...' if len(reasoning) > 150 else ''}\n"
-                history_str += f"  Suggestion Given: {suggestion[:100]}{'...' if len(suggestion) > 100 else ''}\n"
-
-            history_str += f"\nStep {len(routing_history) + 1} (You): {current_agent_id}\n"
-            history_str += "=== END OF PATH ===\n"
+                history_str += f"Step {i}: {decision.get('selected', 'Unknown')} (Why: {decision.get('reasoning', '')[:50]}...)\n"
+            history_str += f"Current Step: You are {current_agent_id}\n"
         else:
-            history_str = f"\n=== ROUTING PATH ===\nStep 1 (First): You are {current_agent_id}\n=== END OF PATH ===\n"
+            history_str += f"Step 1: You are {current_agent_id}\n"
+        history_str += "=== END OF HISTORY ===\n"
 
-        # 循环警告
-        loop_warning_str = ""
-        if loop_warnings:
-            loop_warning_str = "\n⚠️ === LOOP WARNINGS === ⚠️\n"
-            for agent, warning in loop_warnings.items():
-                loop_warning_str += f"- {warning}\n"
-            loop_warning_str += "Avoid these agents unless truly necessary.\n=== END OF WARNINGS ===\n"
-
-        # 识别 Decision Maker
         decision_maker = None
         for agent in candidate_agents:
             if 'final' in agent.lower() or 'decision' in agent.lower():
                 decision_maker = agent
                 break
 
-        prompt = f"""You are {current_agent_id}, coordinating a multi-agent system to solve a complex task.
-
-=== TASK ===
-{task}
-
-=== YOUR RECENT OUTPUT ===
-{current_output}
-
-{history_str}
-
-{loop_warning_str}
-
-=== YOUR PERSPECTIVE (Private Beliefs) ===
-{context}
-
-=== CANDIDATE AGENTS ===
-{', '.join(candidate_agents)}
-
-**Decision Maker**: `{decision_maker if decision_maker else 'final_decision'}` - Select this to END the chain
-
-=== YOUR DECISION ===
-**CRITICAL**: 
-1. Review the COMPLETE routing path above
-2. Assess: Is the task fully resolved? Or does it need more work?
-3. If RESOLVED: Select the Decision Maker ({decision_maker}) to end the chain
-4. If NOT: Select an agent that brings NEW value
-
-**DO NOT** select invalid names like "none" - use the exact names from the candidate list.
-
-Respond in this EXACT format:
-REASONING: <detailed analysis considering path history, completeness, and loop risks>
-SELECTED: <exact agent name from candidates list>
-SUGGESTION: <brief, actionable advice - under 50 words>
-"""
+        prompt = f"""You are {current_agent_id}, coordinating a multi-agent system.
+    
+    {history_str}
+    
+    === AGENT BELIEFS ===
+    {context}
+    
+    === CANDIDATE AGENTS ===
+    {', '.join(candidate_agents)}
+    (Decision Maker: {decision_maker if decision_maker else 'final_decision'})
+    
+    === YOUR DECISION ===
+    **CRITICAL**: 
+    1. **Did you FAIL or PARTIALLY complete the task?**
+       - If YES -> Select a helper agent. DO NOT END.
+    2. **Is task FULLY resolved?**
+       - If YES -> Select {decision_maker} to END.
+    3. **Loop Risk?**
+       - Avoid agents used recently.
+    
+    Respond in this EXACT format:
+    REASONING: <analysis>
+    SELECTED: <agent name>
+    SUGGESTION: <advice>
+    """
         return prompt
+
 
     def _parse_llm_route_response_v2(
             self,
@@ -449,7 +579,7 @@ SUGGESTION: <brief, actionable advice - under 50 words>
             candidate_agents: List[str]
     ) -> Tuple[str, str, str, bool]:
         """
-        解析LLM路由响应 (v4.3.2: 增强版)
+        解析LLM路由响应 (v4.3.2: 增强版 - 包含失败检测)
 
         Returns:
             (selected_agent, reasoning, suggestion, termination_requested)
@@ -472,25 +602,54 @@ SUGGESTION: <brief, actionable advice - under 50 words>
             elif line.startswith('SUGGESTION:'):
                 suggestion = line.replace('SUGGESTION:', '').strip()
 
-        # **Step 2: 检测终止意图**
+        # **Step 2: ✅ 检测失败信号 (新增)**
+        # 防止 LLM 虽然嘴上说失败了，手却选了 Decision Maker
+        # failure_keywords = [
+        #     'cannot', 'unable to', 'failed to', 'missing',
+        #     'incomplete', 'need help', 'requires', 'should ask',
+        #     'i need', 'not enough', 'lack', 'insufficient'
+        # ]
+
+        has_failure_signal = False
+        # if reasoning:
+        #     reasoning_lower = reasoning.lower()
+        #     has_failure_signal = any(kw in reasoning_lower for kw in failure_keywords)
+        #
+        # if has_failure_signal:
+        #     print(f"[Parse] Detected FAILURE signal in reasoning - preventing termination")
+        #     # 如果 LLM 选择了 Decision Maker，强制改为选择其他 Agent
+        #     if selected_agent:
+        #         selected_lower = selected_agent.lower()
+        #         if 'final' in selected_lower or 'decision' in selected_lower:
+        #             print(f"[Parse] Overriding Decision Maker selection due to failure signal")
+        #             # 选择第一个非 Decision Maker 作为 fallback
+        #             for agent in candidate_agents:
+        #                 if 'final' not in agent.lower() and 'decision' not in agent.lower():
+        #                     selected_agent = agent
+        #                     suggestion = f"Previous agent reported issues: {suggestion or 'Please help address the failure'}"
+        #                     break
+
+        # **Step 3: 检测终止意图**
         termination_keywords = ['none', 'end', 'stop', 'finish', 'complete', 'resolved', 'done']
-        if selected_agent:
+
+        # 只有在没有失败信号时，才允许检测终止
+        if selected_agent and not has_failure_signal:
             selected_lower = selected_agent.lower()
             if any(keyword in selected_lower for keyword in termination_keywords):
                 termination_requested = True
                 print(f"[Parse] Detected termination intent: '{selected_agent}'")
 
-        # **Step 3: 检测推理中的终止意图**
-        if reasoning:
+        # **Step 4: 检测推理中的终止意图**
+        if reasoning and not has_failure_signal:
             reasoning_lower = reasoning.lower()
             if ('no further' in reasoning_lower or
-                'fully resolved' in reasoning_lower or
-                'task is complete' in reasoning_lower or
-                'end the chain' in reasoning_lower):
+                    'fully resolved' in reasoning_lower or
+                    'task is complete' in reasoning_lower or
+                    'end the chain' in reasoning_lower):
                 termination_requested = True
                 print(f"[Parse] Detected termination intent in reasoning")
 
-        # **Step 4: 容错处理**
+        # **Step 5: 容错处理**
         if not selected_agent or selected_agent.lower() not in [a.lower() for a in candidate_agents]:
             print(f"[Warning] Invalid/missing selection: '{selected_agent}'")
 
@@ -517,6 +676,7 @@ SUGGESTION: <brief, actionable advice - under 50 words>
 
         return selected_agent, reasoning, suggestion, termination_requested
 
+
     def get_statistics(self) -> Dict:
         """获取统计信息 (v4.3.2: 新增终止统计)"""
         total_ops = (self.stats['cold_start_count'] +
@@ -531,8 +691,10 @@ SUGGESTION: <brief, actionable advice - under 50 words>
             **self.stats,
             'total_operations': total_ops,
             'kv_cache_hit_rate': kv_cache_hit_rate,
-            'loop_detection_rate': self.stats['loop_detections'] / self.stats['post_hoc_route_count'] if self.stats['post_hoc_route_count'] > 0 else 0,
-            'termination_attempt_rate': self.stats['termination_attempts'] / self.stats['post_hoc_route_count'] if self.stats['post_hoc_route_count'] > 0 else 0,
+            'loop_detection_rate': self.stats['loop_detections'] / self.stats['post_hoc_route_count'] if self.stats[
+                                                                                                             'post_hoc_route_count'] > 0 else 0,
+            'termination_attempt_rate': self.stats['termination_attempts'] / self.stats['post_hoc_route_count'] if
+            self.stats['post_hoc_route_count'] > 0 else 0,
             'avg_tokens_per_llm_route': (
                 self.stats['total_tokens_used'] / self.stats['post_hoc_route_count']
                 if self.stats['post_hoc_route_count'] > 0 else 0

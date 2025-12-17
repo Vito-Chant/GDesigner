@@ -332,8 +332,9 @@ Examples:
     parser.add_argument(
         '--roles',
         nargs='+',
-        default=['Knowlegable Expert', 'Critic', 'Mathematician', 'Psychologist', 'Historian'],
-        help='List of agent roles (default: 5 roles)'
+        default=['Knowlegable Expert', 'Critic', 'Mathematician', 'Psychologist', 'Historian', 'Lawyer'],
+        # , 'Doctor', 'Economist', 'Programmer'
+        help='List of agent roles'
     )
 
     parser.add_argument(

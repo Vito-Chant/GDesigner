@@ -61,6 +61,9 @@ class AnalyzeAgent(Node):
         """
         # === 1. 基础 Prompt ===
         system_prompt = f"{self.constraint}"
+        if 'system_instruction' in raw_inputs:
+            system_prompt += f"\n\n**SYSTEM INSTRUCTION**:\n{raw_inputs['system_instruction']}"
+
 
         # 基础任务描述
         if self.role != 'Fake':

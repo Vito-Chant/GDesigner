@@ -87,23 +87,68 @@ class FinalRefer(Node):
         self.llm = LLMRegistry.get(llm_name)
         self.prompt_set = PromptSetRegistry.get(domain)
 
-    def _process_inputs(self, raw_inputs: Dict[str, str], spatial_info: Dict[str, Any], temporal_info: Dict[str, Any],
-                        **kwargs) -> List[Any]:
-        """ To be overriden by the descendant class """
-        """ Process the raw_inputs(most of the time is a List[Dict]) """
+    def _process_inputs(
+            self,
+            raw_inputs: Dict[str, str],
+            spatial_info: Dict[str, Any],
+            temporal_info: Dict[str, Any],
+            **kwargs
+    ) -> List[Any]:
+        """处理输入 (v4.3.2: 增强历史提取)"""
+
         self.role = self.prompt_set.get_decision_role()
         self.constraint = self.prompt_set.get_decision_constraint()
         system_prompt = f"{self.role}.\n {self.constraint}"
 
+        # ✅ 修改后: 更清晰的历史组织
         spatial_str = ""
-        for id, info in spatial_info.items():
-            # [Modification]: Extract content if output is a tuple
+
+        # 按步骤顺序排序（如果键名是 previous_step_N 格式）
+        sorted_items = sorted(
+            spatial_info.items(),
+            key=lambda x: (
+                int(x[0].split('_')[-1])
+                if 'step' in x[0] and x[0].split('_')[-1].isdigit()
+                else 999
+            )
+        )
+
+        for agent_id, info in sorted_items:
             output_content = extract_content(info['output'])
-            spatial_str += id + ": " + output_content + "\n\n"
+            role_desc = info.get('role', agent_id)
+
+            # ✅ 更结构化的输出格式
+            spatial_str += f"\n--- {role_desc} ---\n"
+            spatial_str += f"{output_content}\n"
 
         decision_few_shot = self.prompt_set.get_decision_few_shot()
-        user_prompt = f"{decision_few_shot} The task is:\n\n {raw_inputs['task']}.\n At the same time, the output of other agents is as follows:\n\n{spatial_str}"
+
+        user_prompt = (
+            f"{decision_few_shot}\n\n"
+            f"The task is:\n\n{raw_inputs['task']}\n\n"
+            f"The outputs from previous agents are:\n{spatial_str}\n\n"
+            f"Based on the above analysis, provide your final decision."
+        )
+
         return system_prompt, user_prompt
+
+    # def _process_inputs(self, raw_inputs: Dict[str, str], spatial_info: Dict[str, Any], temporal_info: Dict[str, Any],
+    #                     **kwargs) -> List[Any]:
+    #     """ To be overriden by the descendant class """
+    #     """ Process the raw_inputs(most of the time is a List[Dict]) """
+    #     self.role = self.prompt_set.get_decision_role()
+    #     self.constraint = self.prompt_set.get_decision_constraint()
+    #     system_prompt = f"{self.role}.\n {self.constraint}"
+    #
+    #     spatial_str = ""
+    #     for id, info in spatial_info.items():
+    #         # [Modification]: Extract content if output is a tuple
+    #         output_content = extract_content(info['output'])
+    #         spatial_str += id + ": " + output_content + "\n\n"
+    #
+    #     decision_few_shot = self.prompt_set.get_decision_few_shot()
+    #     user_prompt = f"{decision_few_shot} The task is:\n\n {raw_inputs['task']}.\n At the same time, the output of other agents is as follows:\n\n{spatial_str}"
+    #     return system_prompt, user_prompt
 
     def _execute(self, input: Dict[str, str], spatial_info: Dict[str, Any], temporal_info: Dict[str, Any], **kwargs):
         """ To be overriden by the descendant class """
