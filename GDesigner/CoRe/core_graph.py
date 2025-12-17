@@ -49,7 +49,7 @@ class CoReGraph:
             decision_method: str = "FinalRefer",
             max_routing: int = 10,
             registry_save_path: Optional[Path] = None,
-            reranker_model: str = "Qwen/Qwen3-Reranker-0.6B",
+            reranker_model: str = "Qwen/Qwen3-Reranker-4B",
             rag_top_k: int = 3,
             max_loop_count: int = 2
     ):
@@ -225,11 +225,20 @@ class CoReGraph:
             # **Step 4: Post-hoc Route**
             # print("Step 4: Post-hoc Routing...")
 
+            # candidate_agents = [
+            #     role.lower().replace(' ', '_')
+            #     for role in self.available_roles
+            #     if role.lower().replace(' ', '_') != current_agent
+            # ]
+
             candidate_agents = [
                 role.lower().replace(' ', '_')
                 for role in self.available_roles
-                if role.lower().replace(' ', '_') != current_agent
             ]
+
+            # 确保不重复添加 (如果 available_roles 里有重复)
+            candidate_agents = list(set(candidate_agents))
+
             candidate_agents.append(self.decision_maker_id)
 
             context = self.mind_registry.get_context_for_routing(
@@ -427,6 +436,7 @@ class CoReGraph:
             # 'kv_cache_hits': self.kv_cache_hits,
             # 'loop_detections': self.loop_detections
         }
+
 
 if __name__ == "__main__":
     pass

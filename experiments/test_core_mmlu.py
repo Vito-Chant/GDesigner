@@ -214,7 +214,7 @@ async def test_core_graph_on_mmlu(
         max_routing=max_routing,
         registry_save_path=None,  # 不保存 registry
         rag_top_k=3,
-        max_loop_count=2
+        max_loop_count=4
     )
 
     # 加载 MMLU 数据集
@@ -332,8 +332,8 @@ Examples:
     parser.add_argument(
         '--roles',
         nargs='+',
-        default=['Knowlegable Expert', 'Critic', 'Mathematician', 'Psychologist', 'Historian', 'Lawyer'],
-        # , 'Doctor', 'Economist', 'Programmer'
+        default=['Critic', 'Mathematician', 'Psychologist', 'Historian', 'Doctor', 'Economist', 'Programmer', 'Lawyer'],
+        # , 'Knowlegable Expert',
         help='List of agent roles'
     )
 

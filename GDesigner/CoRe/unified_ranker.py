@@ -70,6 +70,7 @@ class QwenRerankerClient:
             {"role": "user", "content": f"<Instruct>: {instruct_content}\n\n<Query>: {query}\n\n<Document>: {doc}"}
         ]
 
+    @weave.op()
     def predict(self, pairs: List[Tuple[str, str]], instruction: Optional[str] = None) -> np.ndarray:
         """
         批量计算 (Query, Document) 对的分数
@@ -251,37 +252,60 @@ class UnifiedRanker:
 
         return "\n\n---\n\n".join(retrieved_texts)
 
-
     def _detect_loop(
             self,
             routing_history: List[Dict],
             current_agent: str,
             candidate_agent: str
     ) -> Tuple[bool, str]:
-        """检测路由循环"""
-        if not routing_history or len(routing_history) < 2:
+        """检测路由循环 (v4.3.5: 支持 ReAct 自循环)"""
+        if not routing_history:
             return False, ""
 
-        agent_sequence = [current_agent]
-        for decision in routing_history:
-            agent_sequence.append(decision.get('selected', ''))
+        # 获取历史路径序列
+        agent_sequence = [d.get('selected', '') for d in routing_history]
 
-        agent_counts = Counter(agent_sequence)
+        # 1. ✅ 检测连续自循环 (Consecutive Self-Loop)
+        # 如果 candidate 是自己，检查是否已经连续太多次了
+        if candidate_agent == current_agent:
+            # 倒序计算当前已经连续了多少次
+            consecutive_count = 1  # 加上当前这次
+            for agent in reversed(agent_sequence):
+                if agent == current_agent:
+                    consecutive_count += 1
+                else:
+                    break
 
-        # 检测短期往复
-        recent_path = agent_sequence[-3:] if len(agent_sequence) >= 3 else agent_sequence
+            # 允许最多连续 3 次 (Step 1 -> Step 2 -> Step 3)
+            MAX_CONSECUTIVE = 3
+            if consecutive_count > MAX_CONSECUTIVE:
+                warning = f"⚠ EXCESSIVE SELF-LOOP: You have selected yourself {consecutive_count} times in a row. Please handover to another agent."
+                self.stats['loop_detections'] += 1
+                return True, warning
 
-        if len(recent_path) >= 2:
-            if recent_path[-1] == current_agent and recent_path[-2] == candidate_agent:
-                loop_count = agent_counts[current_agent]
-                if loop_count >= self.max_loop_count:
-                    warning = f"⚠ LOOP DETECTED: {current_agent} ↔ {candidate_agent} (Count: {loop_count})"
+            # 如果没超限，允许自选
+            return False, ""
+
+        # 2. 检测 A -> B -> A 的乒乓循环 (Ping-Pong)
+        if len(agent_sequence) >= 2:
+            if agent_sequence[-1] == candidate_agent:
+                # 上一步选的就是 candidate (这其实被上面的自循环逻辑覆盖了，但保留作为保险)
+                pass
+            elif len(agent_sequence) >= 2 and agent_sequence[-2] == candidate_agent:
+                # 这种 A->B->A 通常是不好的，除非 B 是 Critic
+                # 可以根据需要放宽，或者保持警告
+                agent_counts = Counter(agent_sequence)
+                if agent_counts[candidate_agent] >= self.max_loop_count:
+                    warning = f"⚠ LOOP DETECTED: {current_agent} ↔ {candidate_agent} (Ping-Pong)"
                     self.stats['loop_detections'] += 1
                     return True, warning
 
-        # 检测长期停滞
-        if agent_counts[candidate_agent] >= 3:
-            warning = f"⚠ REPEATED AGENT: {candidate_agent} already used {agent_counts[candidate_agent]} times"
+        # 3. 总次数限制 (放宽)
+        # ReAct 模式下，主力 Agent (如 MathSolver) 可能会被多次使用
+        agent_counts = Counter(agent_sequence)
+        total_limit = 6  # 提高总上限
+        if agent_counts[candidate_agent] >= total_limit:
+            warning = f"⚠ REPEATED AGENT: {candidate_agent} used too many times ({agent_counts[candidate_agent]})"
             return True, warning
 
         return False, ""
@@ -498,7 +522,13 @@ class UnifiedRanker:
        - Select an appropriate regular agent
        - Provide a clear suggestion for what they should focus on
     
-    4. **NEVER select "none" or invalid names** - always choose from the list above
+    4. **SELF-CORRECTION & MULTI-STEP REASONING:**
+           - You can SELECT YOURSELF ({current_agent_id}) if:
+             * You need to verify your own code/calculation.
+             * You need to perform the next step of a complex task.
+             * You realized you made a mistake and want to fix it.
+    
+    5. **NEVER select "none" or invalid names** - always choose from the list above
     
     **Decision Format** (MUST follow exactly):
     REASONING: <detailed analysis: Is task complete? Any failure signals? Loop risks?>
