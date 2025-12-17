@@ -179,7 +179,8 @@ async def test_core_graph_on_mmlu(
         max_routing: int = 5,
         limit_questions: int = None,
         batch_size: int = 1,
-        save_results: bool = True
+        save_results: bool = True,
+        **kwargs
 ):
     """
     在 MMLU 验证集上测试 CoRe Graph
@@ -299,6 +300,17 @@ async def test_core_graph_on_mmlu(
         output_file = result_dir / f"core_test_{llm_name.replace('/', '_')}_{timestamp}.json"
         metrics.save_results(output_file)
 
+    if "wandb_run" in kwargs:
+        kwargs["wandb_run"].log({
+            "accuracy": metrics.get_accuracy(),
+            "avg_time": metrics.get_avg_time(),
+            "avg_tokens": metrics.get_avg_tokens(),
+            "avg_steps": metrics.get_avg_steps(),
+            "kv_cache_hit_rate": metrics.get_kv_cache_hit_rate(),
+            "loop_rate": metrics.get_loop_rate(),
+            "total_cost": Cost.instance().value
+        })
+
     return metrics
 
 
@@ -332,8 +344,8 @@ Examples:
     parser.add_argument(
         '--roles',
         nargs='+',
-        default=['Critic', 'Mathematician', 'Psychologist', 'Historian', 'Doctor', 'Economist', 'Programmer', 'Lawyer'],
-        # , 'Knowlegable Expert',
+        default=['Mathematician', 'Programmer'],
+        # , 'Knowlegable Expert', 'Critic', 'Psychologist', 'Historian', 'Doctor', 'Economist', 'Lawyer'
         help='List of agent roles'
     )
 
@@ -393,10 +405,25 @@ Examples:
 
 async def main():
     """主函数"""
+    import wandb
+
     args = parse_args()
+
+    # 1. 拆分：如果传入的是单个空格分隔字符串 (如 "AgentA AgentB")
+    if len(args.roles) == 1 and ' ' in args.roles[0]:
+        args.roles = args.roles[0].split()
+
+    # 2. 还原：无论是一个还是多个，统一将下划线替换回空格
+    #    修复: "Knowlegable_Expert" -> "Knowlegable Expert"
+    args.roles = [r.replace('_', ' ') for r in args.roles]
 
     # 初始化 Weave
     weave.init(project_name=args.weave_project)
+    wandb_run = wandb.init(
+        project="CoRe-MMLU-Test",
+        config=args,
+        name=time.strftime("%Y-%m-%d_%H-%M-%S")
+    )
 
     print("\n" + "=" * 80)
     print("CoRe GRAPH SYSTEM - MMLU PERFORMANCE TEST")
@@ -415,7 +442,8 @@ async def main():
             max_routing=args.max_routing,
             limit_questions=args.limit,
             batch_size=args.batch_size,
-            save_results=not args.no_save
+            save_results=not args.no_save,
+            wandb_run=wandb_run
         )
 
         # 额外分析
@@ -455,6 +483,7 @@ async def main():
         print("\n" + "=" * 80)
         print("TEST COMPLETED SUCCESSFULLY")
         print("=" * 80 + "\n")
+
 
     except KeyboardInterrupt:
         print("\n\n⚠️  Test interrupted by user")

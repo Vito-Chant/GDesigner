@@ -16,7 +16,7 @@ except ImportError:
     HAS_UMAP = False
 
 # === 配置 ===
-DATA_DIR = "validation_data_v3"
+DATA_DIR = "validation_data_v2"
 st.set_page_config(page_title="MMLU Logprobs Visualization", layout="wide")
 
 # === 1. 数据加载函数 (带缓存) ===

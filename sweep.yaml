@@ -1,17 +1,100 @@
-program: experiments/run_mmlu.py
-method: grid # 或者 random, bayes
+# sweep.yaml
+program: experiments/test_core_mmlu.py
+method: grid  # 使用网格搜索遍历所有组合
+project: CoRe-MMLU-Test
+entity: vito_chan  # 如果需要指定用户名
+
 metric:
-  name: accuracy # 需要你在 run_mmlu.py 里 log 这个名字
+  name: accuracy
   goal: maximize
+
 parameters:
-  mode:
-    values: ["FullConnected", "Random", "Chain",'Debate','Layered','Mesh','Star']
-  agent_nums:
-    values: [3, 5, 7]
-  tokens:
-    values: [20, 50, 100, 200, 400, 600, 800, 1000, 2000]
+  # --- 核心变量：Agent 组合 ---
+  # 注意：由于 argparse nargs='+', W&B 传入时会作为单个字符串
+  # 代码中需要增加 split() 处理 (见下文代码修改指南)
+  roles:
+      values:
+        # --- 1. 单兵作战基线 (9种) ---
+        - "Knowlegable_Expert"
+        - "Mathematician"
+        - "Programmer"
+        - "Economist"
+        - "Psychologist"
+        - "Historian"
+        - "Doctor"
+        - "Lawyer"
+        - "Critic"  # 仅作为对照，通常需要配合其他Agent
+
+        # --- 2. 经典双人搭档 (10种) ---
+        - "Knowlegable_Expert Critic"         # 标配：执行+检查
+        - "Mathematician Critic"              # 严谨逻辑检查
+        - "Programmer Critic"                 # 代码审查模式
+        - "Mathematician Programmer"          # 算法实现搭档
+        - "Doctor Psychologist"               # 身心健康会诊
+        - "Economist Mathematician"           # 计量经济学搭档
+        - "Historian Lawyer"                  # 文科/证据分析
+        - "Knowlegable_Expert Programmer"     # 知识工程
+        - "Knowlegable_Expert Doctor"         # 医疗咨询
+        - "Lawyer Economist"                  # 商业法规
+
+        # --- 3. 三人特种小队 (11种) ---
+        - "Knowlegable_Expert Critic Mathematician"
+        - "Knowlegable_Expert Critic Programmer"
+        - "Knowlegable_Expert Critic Psychologist"
+        - "Doctor Psychologist Critic"        # 完整医疗评估
+        - "Programmer Mathematician Economist" # 金融科技小队
+        - "Historian Lawyer Psychologist"     # 社会科学分析
+        - "Mathematician Programmer Critic"   # 硬核STEM
+        - "Lawyer Economist Critic"           # 风险评估小队
+        - "Doctor Biologist Critic"           # (假设Biologist可用,这里用Doctor代替) -> Doctor Knowlegable_Expert Critic
+        - "Historian Economist Lawyer"        # 宏观政策分析
+        - "Psychologist Critic Knowlegable_Expert"
+
+        # --- 4. 四人综合小组 (10种) ---
+        - "Knowlegable_Expert Critic Mathematician Programmer" # 全能理科组
+        - "Historian Psychologist Lawyer Economist"            # 全能文科组
+        - "Doctor Psychologist Knowlegable_Expert Critic"      # 深度医疗组
+        - "Programmer Mathematician Economist Critic"          # 量化分析组
+        - "Lawyer Economist Historian Critic"
+        - "Mathematician Programmer Doctor Critic"
+        - "Psychologist Historian Knowlegable_Expert Critic"
+        - "Knowlegable_Expert Programmer Lawyer Economist"     # 创业公司模拟
+        - "Doctor Psychologist Historian Lawyer"
+        - "Mathematician Economist Psychologist Critic"        # 行为经济学
+
+        # --- 5. 大型/全科团队 (10种) ---
+        - "Knowlegable_Expert Critic Mathematician Programmer Economist"
+        - "Knowlegable_Expert Critic Psychologist Historian Lawyer"
+        - "Doctor Psychologist Historian Lawyer Economist"
+        - "Programmer Mathematician Economist Lawyer Critic"
+        - "Mathematician Programmer Doctor Knowlegable_Expert Critic"
+        - "Psychologist Historian Economist Lawyer Critic"
+        - "Knowlegable_Expert Mathematician Doctor Lawyer Historian Critic"
+        - "Knowlegable_Expert Critic Mathematician Programmer Psychologist Historian"
+        - "Programmer Mathematician Economist Lawyer Doctor Psychologist Critic"
+        # 全员集结 (9人)
+        - "Knowlegable_Expert Critic Mathematician Psychologist Historian Doctor Economist Programmer Lawyer"
+        -
+  # --- 核心变量：路由步数 ---
+  max_routing:
+    values: [8]
+
+  # --- 固定参数 ---
+  llm_name:
+    value: "Qwen/Qwen3-4B-Instruct-2507"
+
+  limit:
+    value: 153  # 限制每个实验跑50题，加快搜索速度
+
+  batch_size:
+    value: 16   # 根据显存调整
+
+  decision_method:
+    value: "FinalRefer"
+
 command:
   - ${env}
   - ${interpreter}
   - ${program}
+  - "--no_save"  # Sweep 时通常不保存本地 JSON 结果以节省空间
   - ${args}
