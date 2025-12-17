@@ -33,17 +33,76 @@ class AgentProfile:
 
 @dataclass
 class RelationalBelief:
-    """关于Agent交互的动态信念"""
+    """
+    关于Agent交互的动态信念 (v4.4 - Success Rate 版)
+
+    **v4.4 关键改进**:
+    - 移除抽象的 confidence (0-1)
+    - 使用 success_count / total_count = success_rate
+    - 更直观、可解释
+    """
     from_agent: str
     to_agent: str
     belief_type: str  # 'trust', 'capability_assessment', 'interaction_pattern'
     content: str
-    confidence: float  # 0-1
-    evidence_count: int
+
+    # ✅ 新增：基于统计的成功率
+    success_count: int  # 成功的交互次数
+    total_count: int  # 总交互次数
+
+    # 保留原有字段（用于兼容性和元数据）
+    evidence_count: int  # 总的证据数量（可以等于 total_count）
     last_updated: str
 
+    @property
+    def success_rate(self) -> float:
+        """计算成功率"""
+        if self.total_count == 0:
+            return 0.5  # 无数据时返回中性值
+        return self.success_count / self.total_count
+
+    @property
+    def confidence(self) -> float:
+        """
+        兼容性属性：为了不破坏现有代码
+
+        计算逻辑：
+        - success_rate 作为基础
+        - 根据样本数量调整（少样本降低信心）
+        """
+        if self.total_count == 0:
+            return 0.5
+
+        # 基础成功率
+        base_rate = self.success_rate
+
+        # 样本量修正（贝叶斯思想）
+        # 少样本时向 0.5 收缩
+        # 公式: adjusted = (successes + prior_successes) / (total + prior_total)
+        prior_strength = 2  # 先验强度（相当于2次交互的经验）
+        prior_success = 1  # 先验成功次数（假设中性）
+
+        adjusted = (self.success_count + prior_success) / (self.total_count + prior_strength)
+
+        return adjusted
+
     def to_text(self) -> str:
-        return f"{self.from_agent} believes: {self.content} (confidence: {self.confidence:.2f})"
+        """转换为自然语言描述"""
+        rate = self.success_rate
+        total = self.total_count
+
+        if total == 0:
+            reliability = "no interaction history"
+        elif rate >= 0.8:
+            reliability = f"highly reliable ({self.success_count}/{total} successes)"
+        elif rate >= 0.6:
+            reliability = f"generally reliable ({self.success_count}/{total} successes)"
+        elif rate >= 0.4:
+            reliability = f"moderately reliable ({self.success_count}/{total} successes)"
+        else:
+            reliability = f"less reliable ({self.success_count}/{total} successes)"
+
+        return f"{self.from_agent} → {self.to_agent}: {self.content} [{reliability}]"
 
 
 class MindRegistry:
@@ -120,9 +179,9 @@ class MindRegistry:
         return self.profiles.get(agent_id)
 
     def get_beliefs_about(
-        self,
-        to_agent: str,
-        from_agent: Optional[str] = None
+            self,
+            to_agent: str,
+            from_agent: Optional[str] = None
     ) -> List[RelationalBelief]:
         """
         获取关于特定Agent的信念
@@ -141,34 +200,26 @@ class MindRegistry:
             self,
             current_agent: str,
             candidate_agents: List[str],
-            task_description: str  # 保留参数以兼容调用，但不使用
+            task_description: str
     ) -> str:
         """
-        为LLM路由决策生成丰富的上下文
-
-        **v4.3.2 关键修改**:
-        - 移除 Task 描述（由 Ranker 统一管理）
-        - 聚焦于 Agent Profiles 和 Beliefs
-        - 减少与 Ranker Prompt 的冗余
+        为LLM路由决策生成丰富的上下文 (v4.4 版)
         """
 
-        # ✅ 修改前: context = f"Current Task: {task_description}\n\n"
-        # ✅ 修改后: 不包含 Task
         context = f"**Your Perspective (as {current_agent}):**\n\n"
 
-        # === 1. 添加候选 Agent 的 Profile（精简格式）===
+        # === 1. 添加候选 Agent 的 Profile ===
         context += "**Candidate Agent Profiles:**\n"
         for agent_id in candidate_agents:
             profile = self.get_agent_profile(agent_id)
             if profile:
-                # ✅ 精简格式：只列出关键信息
                 context += f"\n• **{agent_id}** ({profile.role}):\n"
                 context += f"  Capabilities: {', '.join(profile.capabilities[:3])}\n"
                 if profile.specializations:
                     context += f"  Specializes in: {', '.join(profile.specializations[:2])}\n"
 
-        # === 2. 添加私有信念（保持详细）===
-        context += f"\n\n**Your Private Beliefs about Candidates:**\n"
+        # === 2. 添加基于成功率的信念 ===
+        context += f"\n\n**Your Interaction History with Candidates:**\n"
         for agent_id in candidate_agents:
             beliefs = self.get_beliefs_about(
                 agent_id,
@@ -177,11 +228,23 @@ class MindRegistry:
             if beliefs:
                 context += f"\n• About **{agent_id}**:\n"
                 for belief in beliefs[-3:]:  # 最近3条
-                    context += (
-                        f"  - {belief.content} "
-                        f"(confidence: {belief.confidence:.2f}, "
-                        f"evidence: {belief.evidence_count})\n"
-                    )
+                    rate = belief.success_rate
+                    total = belief.total_count
+
+                    # ✅ 新格式：显示成功率统计
+                    if total == 0:
+                        stats = "No interaction history"
+                    else:
+                        stats = f"{belief.success_count}/{total} successful interactions ({rate:.1%})"
+
+                    context += f"  - {belief.content}\n"
+                    context += f"    📊 Track Record: {stats}\n"
+
+                    # 添加可靠性评估
+                    if rate >= 0.8 and total >= 3:
+                        context += f"    ✓ Highly reliable for this type of task\n"
+                    elif rate < 0.4 and total >= 3:
+                        context += f"    ⚠ Consider alternatives or provide extra guidance\n"
             else:
                 context += f"\n• About **{agent_id}**: No prior interactions\n"
 

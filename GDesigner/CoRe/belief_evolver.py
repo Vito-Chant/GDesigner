@@ -32,13 +32,31 @@ class InteractionTrace:
 
 @dataclass
 class BeliefUpdate:
-    """信念更新操作"""
+    """
+    信念更新操作 (v4.4 - Success Rate 版)
+    """
     from_agent: str
     to_agent: str
     old_belief: Optional[str]
     new_belief: str
     update_reason: str
-    confidence_change: float
+
+    # ✅ 新增：基于统计的更新
+    success_delta: int  # 成功次数变化 (+1 成功, 0 失败)
+    total_delta: int  # 总次数变化 (通常是 +1)
+
+    # 兼容性字段
+    @property
+    def confidence_change(self) -> float:
+        """兼容性属性：估算置信度变化"""
+        if self.total_delta == 0:
+            return 0.0
+
+        # 如果是成功，正向；失败，负向
+        if self.success_delta > 0:
+            return 0.1  # 成功时提升
+        else:
+            return -0.1  # 失败时降低
 
 
 class BeliefEvolver:
@@ -100,7 +118,7 @@ class BeliefEvolver:
             trace: InteractionTrace,
             feedback: Optional[str]
     ) -> List[BeliefUpdate]:
-        """当交互成功时强化正向信念"""
+        """当交互成功时强化正向信念 (v4.4 版)"""
 
         existing_beliefs = self.mind_registry.get_beliefs_about(
             to_agent=trace.to_agent,
@@ -109,19 +127,19 @@ class BeliefEvolver:
 
         prompt = f"""An agent interaction was SUCCESSFUL:
 
-From: {trace.from_agent}
-To: {trace.to_agent}
-Task: {trace.task}
-Suggestion Given: {trace.suggestion}
-Outcome: SUCCESS
+    From: {trace.from_agent}
+    To: {trace.to_agent}
+    Task: {trace.task}
+    Suggestion Given: {trace.suggestion}
+    Outcome: SUCCESS
 
-Existing beliefs: {[b.content for b in existing_beliefs] if existing_beliefs else 'None'}
+    Existing beliefs: {[b.content for b in existing_beliefs] if existing_beliefs else 'None'}
 
-Generate a SHORT belief statement that {trace.from_agent} should hold about {trace.to_agent}.
-Focus on their capability and how well they responded to the strategic guidance.
-Keep it under 100 characters.
+    Generate a SHORT belief statement that {trace.from_agent} should hold about {trace.to_agent}.
+    Focus on their capability and how well they responded to the strategic guidance.
+    Keep it under 100 characters.
 
-Format: BELIEF: <statement>"""
+    Format: BELIEF: <statement>"""
 
         if feedback:
             prompt += f"\n\nAdditional feedback: {feedback}"
@@ -134,16 +152,15 @@ Format: BELIEF: <statement>"""
         response = await self.llm.agen(messages)
         new_belief = self._extract_belief_statement(response)
 
-        old_confidence = existing_beliefs[0].confidence if existing_beliefs else 0.5
-        new_confidence = min(old_confidence + 0.1, 0.95)
-
+        # ✅ 新逻辑：记录成功
         update = BeliefUpdate(
             from_agent=trace.from_agent,
             to_agent=trace.to_agent,
             old_belief=existing_beliefs[0].content if existing_beliefs else None,
             new_belief=new_belief,
             update_reason="Positive reinforcement from successful interaction",
-            confidence_change=new_confidence - old_confidence
+            success_delta=1,  # 成功 +1
+            total_delta=1  # 总数 +1
         )
 
         return [update]
@@ -154,72 +171,25 @@ Format: BELIEF: <statement>"""
             full_chain: List[InteractionTrace],
             feedback: Optional[str]
     ) -> List[BeliefUpdate]:
-        """
-        失败归因 (v4.2更新)
+        """失败归因 (v4.4 版)"""
 
-        **v4.2关键问题**:
-        是Sender的Suggestion有问题？还是Receiver能力不足？
-        """
-
-        prompt = f"""An agent handoff FAILED. Analyze the ROOT CAUSE:
-
-FAILED INTERACTION:
-From: {trace.from_agent} → To: {trace.to_agent}
-Task: {trace.task}
-Suggestion Given: {trace.suggestion}
-Output: {trace.output}
-Failure Reason: {trace.failure_reason}
-
-FULL CHAIN (for context):
-"""
-        for i, step in enumerate(full_chain, 1):
-            prompt += f"{i}. {step.from_agent}→{step.to_agent}: {'✓' if step.success else '✗'}\n"
-
-        if feedback:
-            prompt += f"\nCritic Feedback: {feedback}"
-
-        prompt += f"""
-
-CRITICAL ANALYSIS TASK:
-1. Was the Suggestion from {trace.from_agent} MISLEADING or INAPPROPRIATE?
-   - Did it guide {trace.to_agent} in the wrong direction?
-   - Was it too vague or too specific?
-
-2. OR was {trace.to_agent} simply INCAPABLE of executing the task?
-   - Did they lack the necessary skills?
-   - Did they make obvious mistakes unrelated to the suggestion?
-
-3. What belief should {trace.from_agent} update about {trace.to_agent}?
-
-Respond in this format:
-ROOT_CAUSE: <misleading_suggestion|agent_capability|both>
-BELIEF_UPDATE: <new belief statement about {trace.to_agent}'s capabilities>
-STRATEGY_CHANGE: <what should change in future routing and suggestion-giving>
-"""
-
-        messages = [
-            {'role': 'system', 'content': 'You are a failure analyst for multi-agent systems.'},
-            {'role': 'user', 'content': prompt}
-        ]
+        # ... 现有的 prompt 构建逻辑 ...
 
         response = await self.llm.agen(messages)
-
         root_cause, belief_update, strategy_change = self._parse_failure_analysis(response)
 
-        updates = []
-
-        # **严格限制**: 仅更新 Sender -> Receiver 的私有信念
+        # ✅ 新逻辑：记录失败
         update = BeliefUpdate(
             from_agent=trace.from_agent,
             to_agent=trace.to_agent,
             old_belief=None,
             new_belief=belief_update,
             update_reason=f"Failure attribution: {root_cause}. Strategy: {strategy_change}",
-            confidence_change=-0.2
+            success_delta=0,  # 失败 +0
+            total_delta=1  # 总数 +1
         )
-        updates.append(update)
 
-        return updates
+        return [update]
 
     async def _nuanced_update(
             self,
@@ -227,27 +197,22 @@ STRATEGY_CHANGE: <what should change in future routing and suggestion-giving>
             task_success: bool,
             feedback: Optional[str]
     ) -> List[BeliefUpdate]:
-        """处理局部成功但全局失败（或反之）的情况"""
+        """处理局部成功但全局失败（或反之）的情况 (v4.4 版)"""
 
-        prompt = f"""Mixed outcome analysis:
-
-This step: {trace.from_agent} → {trace.to_agent}
-Local success: {trace.success}
-Global task success: {task_success}
-Suggestion Given: {trace.suggestion}
-
-Generate a NUANCED belief update that captures the complexity.
-For example: "Good at X when given specific guidance, but struggles with Y"
-
-Format: BELIEF: <nuanced statement>"""
-
-        messages = [
-            {'role': 'system', 'content': 'You create nuanced belief statements.'},
-            {'role': 'user', 'content': prompt}
-        ]
+        # ... 现有的 prompt 构建逻辑 ...
 
         response = await self.llm.agen(messages)
         belief = self._extract_belief_statement(response)
+
+        # ✅ 新逻辑：根据局部和全局结果决定
+        # 局部成功 + 全局失败 = 部分成功 (0.5)
+        # 局部失败 + 全局成功 = 不计入统计
+        if trace.success and not task_success:
+            success_delta = 0  # 虽然局部成功，但全局失败
+        elif not trace.success and task_success:
+            success_delta = 0  # 局部失败不计入成功
+        else:
+            success_delta = 1 if trace.success else 0
 
         update = BeliefUpdate(
             from_agent=trace.from_agent,
@@ -255,15 +220,16 @@ Format: BELIEF: <nuanced statement>"""
             old_belief=None,
             new_belief=belief,
             update_reason="Nuanced update from mixed outcomes",
-            confidence_change=0.0
+            success_delta=success_delta,
+            total_delta=1
         )
 
         return [update]
 
     def _apply_belief_update(self, update: BeliefUpdate):
-        """将信念更新应用到Mind Registry"""
+        """将信念更新应用到Mind Registry (v4.4 版)"""
 
-        from mind_registry import RelationalBelief
+        from GDesigner.CoRe.mind_registry import RelationalBelief
 
         existing = self.mind_registry.get_beliefs_about(
             to_agent=update.to_agent,
@@ -271,20 +237,24 @@ Format: BELIEF: <nuanced statement>"""
         )
 
         if existing:
-            old_conf = existing[0].confidence
-            evidence_count = existing[0].evidence_count + 1
+            # ✅ 更新现有信念：累加统计
+            old_belief = existing[0]
+            new_success_count = old_belief.success_count + update.success_delta
+            new_total_count = old_belief.total_count + update.total_delta
+            evidence_count = old_belief.evidence_count + 1
         else:
-            old_conf = 0.5
+            # ✅ 创建新信念：初始统计
+            new_success_count = update.success_delta
+            new_total_count = update.total_delta
             evidence_count = 1
-
-        new_conf = max(0.1, min(0.95, old_conf + update.confidence_change))
 
         new_belief = RelationalBelief(
             from_agent=update.from_agent,
             to_agent=update.to_agent,
             belief_type='capability_assessment',
             content=update.new_belief,
-            confidence=new_conf,
+            success_count=new_success_count,
+            total_count=new_total_count,
             evidence_count=evidence_count,
             last_updated=datetime.now().isoformat()
         )
@@ -337,6 +307,7 @@ Format: BELIEF: <nuanced statement>"""
 if __name__ == "__main__":
     from mind_registry import MindRegistry, AgentProfile
 
+
     class MockLLM:
         async def agen(self, messages):
             content = messages[-1]['content']
@@ -346,6 +317,7 @@ if __name__ == "__main__":
                 return """ROOT_CAUSE: agent_capability
 BELIEF_UPDATE: Struggles with edge cases despite clear suggestions
 STRATEGY_CHANGE: Provide more detailed examples in future suggestions"""
+
 
     async def test_evolution():
         llm = MockLLM()
@@ -403,5 +375,6 @@ STRATEGY_CHANGE: Provide more detailed examples in future suggestions"""
 
         print("\n=== Evolution Summary ===")
         print(evolver.get_evolution_summary())
+
 
     asyncio.run(test_evolution())

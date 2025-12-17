@@ -409,7 +409,6 @@ class UnifiedRanker:
             loop_detected=is_loop
         )
 
-
     def _build_enhanced_routing_instruction(
             self,
             task: str,
@@ -422,29 +421,69 @@ class UnifiedRanker:
             loop_warnings: Dict[str, str]
     ) -> str:
         """
-        构建增强的路由指令 (v4.3.2: 明确终止机制与Prompt优化)
+        构建增强的路由指令 (v4.3.3 路由历史优化版)
+
+        **v4.3.3 关键修复**:
+        - 清晰区分 Cold Start、Agent 执行、路由决策
+        - 统一步骤编号逻辑
+        - 避免信息重复和混乱
         """
 
-        # === 1. 构建详细的路径历史（统一格式）===
+        # === 1. 构建清晰的路径历史 ===
         path_summary = "\n=== ROUTING HISTORY ===\n"
+
         if not routing_history:
-            path_summary += (
-                f"Step 0 (Cold Start): Selected {current_agent_id}\n"
-                f"  Reason: Initial selection by system\n"
-                f"  Suggestion: Analyze task\n"
-                f"\nYou are at Step 1 (Current): {current_agent_id}\n"
-            )
+            # ❌ 不应该出现这种情况，但作为保险
+            path_summary += f"Step 0 (Cold Start): Selected {current_agent_id}\n"
+            path_summary += f"  Reason: Initial system selection\n"
+            path_summary += f"  Suggestion: Analyze the task\n"
+            path_summary += f"\nCurrent Step 1: You just executed as {current_agent_id}\n"
+
+        elif len(routing_history) == 1:
+            # ✅ 第一次路由 LLM 调用（Cold Start 后）
+            cold_start = routing_history[0]
+            selected = cold_start.get('selected', 'Unknown')
+
+            path_summary += f"Step 0 (Cold Start): System selected → {selected}\n"
+            path_summary += f"  Method: Reranker based on task-profile similarity\n"
+            path_summary += f"  Suggestion: {cold_start.get('suggestion', 'Analyze the task')}\n"
+            path_summary += f"\nStep 1: {selected} executed and completed\n"
+            path_summary += f"  Output: {current_output[:100]}{'...' if len(current_output) > 100 else ''}\n"
+            path_summary += f"\n🎯 Current Step 2: You are now making the FIRST routing decision\n"
+            path_summary += f"  Previous agent: {current_agent_id}\n"
+            path_summary += f"  Task: Decide who should continue the work\n"
+
         else:
-            path_summary += f"Step 0 (Cold Start): Selected {routing_history[0].get('selected', 'Unknown')}\n"
-            for i, decision in enumerate(routing_history, 1):
+            # ✅ 后续的路由 LLM 调用
+            # Step 0: Cold Start
+            cold_start = routing_history[0]
+            path_summary += f"Step 0 (Cold Start): System selected → {cold_start.get('selected', 'Unknown')}\n"
+
+            # Step 1 到 N: 按顺序显示每次路由决策和执行
+            for i, decision in enumerate(routing_history[1:], 1):
                 selected = decision.get('selected', 'Unknown')
                 reasoning = decision.get('reasoning', 'N/A')
                 suggestion = decision.get('suggestion', 'N/A')
-                path_summary += f"\nStep {i}: → {selected}\n"
-                path_summary += f"  Reasoning: {reasoning[:100]}{'...' if len(reasoning) > 100 else ''}\n"
-                path_summary += f"  Suggestion: {suggestion[:80]}{'...' if len(suggestion) > 80 else ''}\n"
+                method = decision.get('method', 'unknown')
 
-            path_summary += f"\nCurrent Step {len(routing_history) + 1}: You are {current_agent_id}\n"
+                # 路由决策步骤
+                path_summary += f"\nStep {i * 2}: Routing Decision #{i}\n"
+                path_summary += f"  Selected: {selected}\n"
+                path_summary += f"  Reasoning: {reasoning[:80]}{'...' if len(reasoning) > 80 else ''}\n"
+                path_summary += f"  Method: {method}\n"
+
+                # Agent 执行步骤
+                path_summary += f"\nStep {i * 2 + 1}: {selected} executed\n"
+                if i == len(routing_history) - 1:
+                    # 最后一个 Agent（当前）
+                    path_summary += f"  Output: {current_output[:100]}{'...' if len(current_output) > 100 else ''}\n"
+
+            # 当前决策点
+            current_step = len(routing_history) * 2
+            path_summary += f"\n🎯 Current Step {current_step}: You are making Routing Decision #{len(routing_history)}\n"
+            path_summary += f"  Previous agent: {current_agent_id}\n"
+            path_summary += f"  Task: Decide who should continue the work\n"
+
         path_summary += "=== END OF HISTORY ===\n"
 
         # === 2. 构建循环警告 ===
@@ -456,7 +495,7 @@ class UnifiedRanker:
             loop_warning_str += "Please AVOID selecting agents with loop warnings unless absolutely necessary.\n"
             loop_warning_str += "=== END OF WARNINGS ===\n"
 
-        # === 3. 识别与构建候选列表（精简格式）===
+        # === 3. 识别与构建候选列表 ===
         decision_maker = None
         regular_agents = []
         for agent in candidate_agents:
@@ -477,28 +516,28 @@ class UnifiedRanker:
 
         candidates_info += "\n  (Note: Detailed profiles for these agents are in 'YOUR BELIEFS' above)\n"
 
-        # === 4. 组装完整指令（优化结构）===
+        # === 4. 组装完整指令 ===
         instruction = f"""
     === ROLE SWITCH: YOU ARE NOW THE COORDINATOR ===
-    
-    Excellent work on the analysis above. Now, please act as the **Coordinator** to decide the next step.
-    
+
+    Now, please act as the **Coordinator** to decide the next step.
+
     {path_summary}
-    
+
     **IMPORTANT: Path Analysis**
     - Review the ENTIRE routing path above
     - Identify patterns: Are we making progress or circling?
     - Consider what each agent has already contributed
-    
+
     {loop_warning_str}
-    
+
     === YOUR BELIEFS & KNOWLEDGE (from Mind Registry) ===
     {context}
-    
+
     {candidates_info}
-    
+
     **CRITICAL DECISION CRITERIA**:
-    
+
     1. **CHECK FOR FAILURE/PARTIAL SUCCESS (HIGHEST PRIORITY):**
        ⚠️ If the current agent's output indicates ANY of the following:
        - Explicitly stated inability to complete the task
@@ -506,42 +545,41 @@ class UnifiedRanker:
        - Asked for help or suggested another agent should handle it
        - Only completed part of the work
        - Contains phrases like "I cannot...", "I need...", "This requires...", "Unable to..."
-       
+
        → **DO NOT select the Decision Maker**
        → **SELECT a different agent** who can address the specific issue
        → Provide clear guidance on what that agent should focus on
-    
+
     2. **If the task is FULLY SOLVED and no more analysis is needed:**
        - All requirements are met
        - No agent has flagged issues or requested help
        - Output is complete and validated
        - Select the Decision Maker: `{decision_maker if decision_maker else 'final_decision'}`
        - This will END the routing chain
-    
+
     3. **If the task needs MORE work (new perspective, verification, implementation):**
        - Select an appropriate regular agent
        - Provide a clear suggestion for what they should focus on
-    
+
     4. **SELF-CORRECTION & MULTI-STEP REASONING:**
-           - You can SELECT YOURSELF ({current_agent_id}) if:
-             * You need to verify your own code/calculation.
-             * You need to perform the next step of a complex task.
-             * You realized you made a mistake and want to fix it.
-    
+       - You can SELECT YOURSELF ({current_agent_id}) if:
+         * You need to verify your own code/calculation.
+         * You need to perform the next step of a complex task.
+         * You realized you made a mistake and want to fix it.
+
     5. **NEVER select "none" or invalid names** - always choose from the list above
-    
+
     **Decision Format** (MUST follow exactly):
     REASONING: <detailed analysis: Is task complete? Any failure signals? Loop risks?>
     SELECTED: <exact agent name from the list above>
     SUGGESTION: <brief, actionable advice - under 50 words>
-    
+
     **Remember**: 
     - **PRIORITY 1**: Check for failure/partial completion signals
     - The routing path is CRUCIAL - don't ignore it!
     - Only select Decision Maker when task is FULLY resolved
     """
         return instruction
-
 
     def _build_fallback_prompt(
             self,
@@ -602,84 +640,163 @@ class UnifiedRanker:
     """
         return prompt
 
-
     def _parse_llm_route_response_v2(
             self,
             response: str,
             candidate_agents: List[str]
     ) -> Tuple[str, str, str, bool]:
         """
-        解析LLM路由响应 (v4.3.2: 增强版 - 包含失败检测)
+        解析LLM路由响应 (v4.3.4 增强解析版)
+
+        **v4.3.4 关键改进**:
+        - 支持多种格式（单行/多行、大小写不敏感）
+        - 更智能的 Agent 名称匹配
+        - 增强的终止检测
+        - 更好的失败信号处理
 
         Returns:
             (selected_agent, reasoning, suggestion, termination_requested)
         """
 
-        lines = response.strip().split('\n')
+        # 预处理：统一格式
+        response_normalized = response.strip()
 
+        # === Step 1: 尝试多种解析策略 ===
         selected_agent = None
         reasoning = ""
         suggestion = ""
-        termination_requested = False
 
-        # **Step 1: 标准解析**
-        for line in lines:
-            line = line.strip()
-            if line.startswith('REASONING:'):
-                reasoning = line.replace('REASONING:', '').strip()
-            elif line.startswith('SELECTED:'):
-                selected_agent = line.replace('SELECTED:', '').strip()
-            elif line.startswith('SUGGESTION:'):
-                suggestion = line.replace('SUGGESTION:', '').strip()
+        # 策略 A: 标准格式（大小写不敏感）
+        import re
 
-        # **Step 2: ✅ 检测失败信号 (新增)**
-        # 防止 LLM 虽然嘴上说失败了，手却选了 Decision Maker
+        # 使用正则表达式提取（支持单行和多行）
+        reasoning_match = re.search(r'REASONING:\s*(.+?)(?=SELECTED:|$)', response_normalized,
+                                    re.IGNORECASE | re.DOTALL)
+        selected_match = re.search(r'SELECTED:\s*(.+?)(?=SUGGESTION:|$)', response_normalized,
+                                   re.IGNORECASE | re.DOTALL)
+        suggestion_match = re.search(r'SUGGESTION:\s*(.+?)$', response_normalized, re.IGNORECASE | re.DOTALL)
+
+        if reasoning_match:
+            reasoning = reasoning_match.group(1).strip()
+        if selected_match:
+            selected_agent = selected_match.group(1).strip()
+        if suggestion_match:
+            suggestion = suggestion_match.group(1).strip()
+
+        # 策略 B: 逐行解析（兜底）
+        if not selected_agent:
+            for line in response_normalized.split('\n'):
+                line = line.strip()
+                line_lower = line.lower()
+
+                if line_lower.startswith('reasoning:') and not reasoning:
+                    reasoning = line.split(':', 1)[1].strip()
+                elif line_lower.startswith('selected:') and not selected_agent:
+                    selected_agent = line.split(':', 1)[1].strip()
+                elif line_lower.startswith('suggestion:') and not suggestion:
+                    suggestion = line.split(':', 1)[1].strip()
+
+        # === Step 2: 清理和标准化 selected_agent ===
+        if selected_agent:
+            # 移除可能的标点符号和多余空格
+            selected_agent = selected_agent.strip('.,;!?`"\' ')
+
+            # 移除可能的解释性文字
+            # 例如："final_decision (to end the chain)" -> "final_decision"
+            if '(' in selected_agent:
+                selected_agent = selected_agent.split('(')[0].strip()
+            if '[' in selected_agent:
+                selected_agent = selected_agent.split('[')[0].strip()
+
+            # 处理可能的换行
+            if '\n' in selected_agent:
+                selected_agent = selected_agent.split('\n')[0].strip()
+
+        # === Step 3: 智能 Agent 名称匹配 ===
+        if selected_agent:
+            # 先尝试精确匹配（不区分大小写）
+            selected_lower = selected_agent.lower()
+            candidate_map = {c.lower(): c for c in candidate_agents}
+
+            if selected_lower in candidate_map:
+                selected_agent = candidate_map[selected_lower]
+            else:
+                # 尝试模糊匹配（部分包含）
+                best_match = None
+                for candidate in candidate_agents:
+                    candidate_lower = candidate.lower()
+                    # 检查是否包含
+                    if candidate_lower in selected_lower or selected_lower in candidate_lower:
+                        best_match = candidate
+                        break
+
+                if best_match:
+                    print(f"[Parse] Fuzzy matched '{selected_agent}' to '{best_match}'")
+                    selected_agent = best_match
+
+        # # === Step 4: 检测失败信号（禁用终止）===
         # failure_keywords = [
         #     'cannot', 'unable to', 'failed to', 'missing',
         #     'incomplete', 'need help', 'requires', 'should ask',
-        #     'i need', 'not enough', 'lack', 'insufficient'
+        #     'i need', 'not enough', 'lack', 'insufficient',
+        #     'error', 'issue', 'problem'
         # ]
 
         has_failure_signal = False
         # if reasoning:
         #     reasoning_lower = reasoning.lower()
         #     has_failure_signal = any(kw in reasoning_lower for kw in failure_keywords)
-        #
-        # if has_failure_signal:
-        #     print(f"[Parse] Detected FAILURE signal in reasoning - preventing termination")
-        #     # 如果 LLM 选择了 Decision Maker，强制改为选择其他 Agent
-        #     if selected_agent:
-        #         selected_lower = selected_agent.lower()
-        #         if 'final' in selected_lower or 'decision' in selected_lower:
-        #             print(f"[Parse] Overriding Decision Maker selection due to failure signal")
-        #             # 选择第一个非 Decision Maker 作为 fallback
-        #             for agent in candidate_agents:
-        #                 if 'final' not in agent.lower() and 'decision' not in agent.lower():
-        #                     selected_agent = agent
-        #                     suggestion = f"Previous agent reported issues: {suggestion or 'Please help address the failure'}"
-        #                     break
 
-        # **Step 3: 检测终止意图**
+        if has_failure_signal:
+            print(f"[Parse] Detected FAILURE signal in reasoning - preventing termination")
+
+        # === Step 5: 检测终止意图 ===
+        termination_requested = False
+
+        # 5.1 检查 selected_agent 中的终止关键词
         termination_keywords = ['none', 'end', 'stop', 'finish', 'complete', 'resolved', 'done']
 
-        # 只有在没有失败信号时，才允许检测终止
         if selected_agent and not has_failure_signal:
             selected_lower = selected_agent.lower()
-            if any(keyword in selected_lower for keyword in termination_keywords):
-                termination_requested = True
-                print(f"[Parse] Detected termination intent: '{selected_agent}'")
 
-        # **Step 4: 检测推理中的终止意图**
-        if reasoning and not has_failure_signal:
-            reasoning_lower = reasoning.lower()
-            if ('no further' in reasoning_lower or
-                    'fully resolved' in reasoning_lower or
-                    'task is complete' in reasoning_lower or
-                    'end the chain' in reasoning_lower):
-                termination_requested = True
-                print(f"[Parse] Detected termination intent in reasoning")
+            # 检查是否明确选择了 Decision Maker
+            is_decision_maker = any(
+                keyword in selected_lower
+                for keyword in ['final', 'decision']
+            )
 
-        # **Step 5: 容错处理**
+            # 或者包含终止关键词
+            has_termination_keyword = any(
+                keyword in selected_lower
+                for keyword in termination_keywords
+            )
+
+            if is_decision_maker or has_termination_keyword:
+                termination_requested = True
+                print(f"[Parse] Detected termination intent in selection: '{selected_agent}'")
+
+        # # 5.2 检查 reasoning 中的终止意图
+        # if reasoning and not has_failure_signal:
+        #     reasoning_lower = reasoning.lower()
+        #     termination_phrases = [
+        #         'no further', 'fully resolved', 'fully solved',
+        #         'task is complete', 'task is solved',
+        #         'end the chain', 'finish the task',
+        #         'all requirements are met', 'no more work needed'
+        #     ]
+        #
+        #     if any(phrase in reasoning_lower for phrase in termination_phrases):
+        #         termination_requested = True
+        #         print(f"[Parse] Detected termination intent in reasoning")
+        #
+        # # 5.3 检查 suggestion 中的终止信号
+        # if suggestion and not has_failure_signal:
+        #     suggestion_lower = suggestion.lower()
+        #     if any(phrase in suggestion_lower for phrase in ['no further action', 'task complete', 'fully resolved']):
+        #         termination_requested = True
+        #         print(f"[Parse] Detected termination intent in suggestion")
+
+        # === Step 6: 容错处理 ===
         if not selected_agent or selected_agent.lower() not in [a.lower() for a in candidate_agents]:
             print(f"[Warning] Invalid/missing selection: '{selected_agent}'")
 
@@ -691,18 +808,34 @@ class UnifiedRanker:
                         print(f"[Fallback] Routing to Decision Maker: {selected_agent}")
                         break
 
-            # 否则使用第一个候选
+            # 否则使用第一个候选（但优先选择非 Decision Maker）
             if not selected_agent or selected_agent.lower() not in [a.lower() for a in candidate_agents]:
-                selected_agent = candidate_agents[0]
+                # 尝试找第一个非 Decision Maker
+                for agent in candidate_agents:
+                    if 'final' not in agent.lower() and 'decision' not in agent.lower():
+                        selected_agent = agent
+                        break
+
+                # 如果都是 Decision Maker，就用第一个
+                if not selected_agent or selected_agent.lower() not in [a.lower() for a in candidate_agents]:
+                    selected_agent = candidate_agents[0]
+
                 reasoning = reasoning or "Failed to parse LLM response, using fallback"
                 suggestion = "Please continue the task using your expertise"
-                print(f"[Fallback] Using first candidate: {selected_agent}")
+                print(f"[Fallback] Using candidate: {selected_agent}")
 
+        # === Step 7: 填充默认值 ===
         if not suggestion:
-            suggestion = "Build on the previous work and focus on quality"
+            if termination_requested:
+                suggestion = "Synthesize all outputs and provide final answer"
+            else:
+                suggestion = "Build on the previous work and focus on quality"
 
         if not reasoning:
-            reasoning = "Selection based on agent capabilities"
+            reasoning = "Selection based on agent capabilities and task requirements"
+
+        # === Step 8: 调试输出 ===
+        print(f"[Parse] Selected: {selected_agent} | Termination: {termination_requested}")
 
         return selected_agent, reasoning, suggestion, termination_requested
 

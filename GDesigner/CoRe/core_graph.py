@@ -344,7 +344,7 @@ class CoReGraph:
         if self.domain == "gsm8k":
             agent_class = "MathSolver"
         elif self.domain == "humaneval":
-            agent_class = "CodeWriting"
+            agent_class = "CoReCodeWriting"
         elif self.domain == "mmlu":
             agent_class = "CoReAnalyzeAgent"
         else:

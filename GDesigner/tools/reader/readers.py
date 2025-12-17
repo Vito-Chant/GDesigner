@@ -34,7 +34,7 @@ from bs4 import BeautifulSoup
 from pylatexenc.latex2text import LatexNodes2Text
 from pptx import Presentation
 
-from GDesigner.llm import VisualLLMRegistry
+from GDesigner.llm import LLMRegistry
 from GDesigner.utils.log import logger
 from GDesigner.utils.globals import Cost
 
