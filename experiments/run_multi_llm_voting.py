@@ -1,10 +1,23 @@
 """
-多LLM加权投票多智能体系统
-支持不同规模的Qwen模型进行协作推理和投票决策
+多LLM加权投票多智能体系统 V2
+支持同构/异构LLM配置、扫描模式、详细数据记录
+
+Features:
+- 同构LLM: 指定单个LLM名字和数量
+- 异构LLM: 指定LLM名字列表
+- 扫描模式: 自动测试1到N个LLM的投票结果
+- 详细数据记录: 保存每道题的投票分布、置信度等元数据
+- WandB集成: 实时记录和可视化
 
 Usage:
-    python experiments/run_multi_llm_voting.py --num_agents 3 --limit 100
-    python experiments/run_multi_llm_voting.py --num_agents 6 --weights 0.1 0.15 0.2 0.1 0.15 0.3
+    # 同构LLM (5个相同模型)
+    python run_multi_llm_voting_v2.py --homogeneous --llm_name "Qwen/Qwen3-4B" --num_agents 5
+
+    # 异构LLM (指定不同模型列表)
+    python run_multi_llm_voting_v2.py --heterogeneous --llm_names "Qwen/Qwen3-0.6B" "Qwen/Qwen3-1.7B" "Qwen/Qwen3-4B"
+
+    # 扫描模式 (测试1到N个LLM)
+    python run_multi_llm_voting_v2.py --homogeneous --llm_name "Qwen/Qwen3-4B" --num_agents 10 --scan_mode
 """
 
 import sys
@@ -17,14 +30,18 @@ import asyncio
 import argparse
 import time
 import json
+import pickle
+import re
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional, Any
+from dataclasses import dataclass, field, asdict
+from collections import Counter, defaultdict
 from tqdm import tqdm
-from collections import Counter
 import math
 
 import weave
 
+# 导入项目依赖
 from GDesigner.llm.llm_registry import LLMRegistry
 from GDesigner.utils.globals import Cost, PromptTokens, CompletionTokens
 from GDesigner.utils.const import GDesigner_ROOT
@@ -32,27 +49,102 @@ from dataset.mmlu_dataset import MMLUDataset
 from dataset.MMLU.download import download
 
 
-class WeightedVotingAgent:
-    """单个投票智能体，基于特定LLM模型"""
+# ============================================================================
+# 数据类定义 - 用于结构化存储实验数据
+# ============================================================================
 
-    def __init__(self, agent_id: str, llm_name: str, weight: float, domain: str = "mmlu", debug: bool = False):
+@dataclass
+class AgentVote:
+    """单个智能体的投票记录"""
+    agent_id: str
+    llm_name: str
+    weight: float
+    raw_response: str
+    extracted_answer: str
+    response_time: float
+    is_correct: bool = False
+
+
+@dataclass
+class QuestionRecord:
+    """单道题目的完整记录"""
+    question_id: int
+    question_text: str
+    correct_answer: str
+    agent_votes: List[AgentVote] = field(default_factory=list)
+
+    # 投票统计
+    final_answer: str = ""
+    is_correct: bool = False
+    vote_distribution: Dict[str, float] = field(default_factory=dict)  # answer -> weighted score
+    raw_vote_counts: Dict[str, int] = field(default_factory=dict)  # answer -> count
+
+    # 一致性指标
+    is_unanimous: bool = False
+    agreement_ratio: float = 0.0  # 最高票答案的占比
+    entropy: float = 0.0  # 投票分布的熵
+
+    # 时间
+    total_time: float = 0.0
+
+
+@dataclass
+class ScanResult:
+    """扫描模式下某个agent数量的结果"""
+    num_agents: int
+    agent_ids: List[str]
+    accuracy: float
+    correct_count: int
+    total_count: int
+    unanimous_ratio: float
+    avg_agreement_ratio: float
+    avg_time: float
+
+
+@dataclass
+class ExperimentMetadata:
+    """实验元数据"""
+    experiment_id: str
+    timestamp: str
+    config: Dict[str, Any]
+
+    # LLM配置
+    llm_configs: List[Tuple[str, float]]
+    is_homogeneous: bool
+
+    # 数据集信息
+    dataset_name: str
+    dataset_split: str
+    total_questions: int
+
+    # 结果汇总
+    question_records: List[QuestionRecord] = field(default_factory=list)
+    scan_results: List[ScanResult] = field(default_factory=list)
+
+    # 性能指标
+    total_cost: float = 0.0
+    total_prompt_tokens: int = 0
+    total_completion_tokens: int = 0
+    total_time: float = 0.0
+
+
+# ============================================================================
+# 核心类
+# ============================================================================
+
+class VotingAgent:
+    """单个投票智能体"""
+
+    def __init__(self, agent_id: str, llm_name: str, weight: float = 1.0, temperature=0.7):
         self.agent_id = agent_id
         self.llm_name = llm_name
         self.weight = weight
-        self.domain = domain
-        self.debug = debug  # 调试模式
         self.llm = LLMRegistry.get(llm_name)
+        self.temperature = temperature
 
-        # 导入prompt
-        from GDesigner.prompt.prompt_set_registry import PromptSetRegistry
-        self.prompt_set = PromptSetRegistry.get(domain)
+    async def vote(self, question: str) -> Tuple[str, float]:
+        """对问题进行投票，返回(原始响应, 响应时间)"""
 
-        print(f"  ✓ Agent [{agent_id}] initialized: {llm_name} (weight={weight:.2f})")
-
-    async def vote(self, question: str) -> str:
-        """对问题进行投票（生成答案）"""
-
-        # 优化的prompt：明确要求在思考后输出格式化答案
         system_prompt = """You are an expert at multiple-choice questions.
 You will be given a question with 4 options (A, B, C, D).
 Only one answer is correct.
@@ -79,668 +171,670 @@ Option B is correct because...
             {'role': 'user', 'content': user_prompt}
         ]
 
-        # 调用LLM生成答案
-        response = await self.llm.agen(messages, temperature=0.7)
+        start_time = time.time()
+        response = await self.llm.agen(messages, temperature=self.temperature)
+        elapsed_time = time.time() - start_time
 
-        return response
+        return response, elapsed_time
 
 
-class MultiLLMVotingSystem:
-    """多LLM加权投票系统"""
+class MultiLLMVotingSystemV2:
+    """多LLM加权投票系统 V2"""
 
-    def __init__(self,
-                 llm_configs: List[Tuple[str, float]],
-                 domain: str = "mmlu"):
+    def __init__(self, llm_configs: List[Tuple[str, float]], temperature=0.7):
         """
         Args:
             llm_configs: List of (llm_name, weight) tuples
-            domain: 数据集领域
         """
-        self.domain = domain
-        self.agents = []
+        self.agents: List[VotingAgent] = []
 
-        print("\n" + "=" * 80)
-        print("INITIALIZING MULTI-LLM VOTING SYSTEM")
-        print("=" * 80)
-
-        # 初始化所有智能体
         for idx, (llm_name, weight) in enumerate(llm_configs):
             agent_id = f"agent_{idx}_{llm_name.split('/')[-1]}"
-            agent = WeightedVotingAgent(
-                agent_id=agent_id,
-                llm_name=llm_name,
-                weight=weight,
-                domain=domain
-            )
+            agent = VotingAgent(agent_id, llm_name, weight, temperature=temperature)
             self.agents.append(agent)
 
-        # 验证权重总和
+        # 归一化权重
         total_weight = sum(agent.weight for agent in self.agents)
-        print(f"\n  Total weight: {total_weight:.2f}")
-
-        if abs(total_weight - 1.0) > 0.01:
-            print(f"  ⚠️  Warning: Weights don't sum to 1.0, normalizing...")
+        if total_weight > 0:
             for agent in self.agents:
                 agent.weight /= total_weight
 
-        print("=" * 80 + "\n")
+    def get_subset(self, num_agents: int) -> 'MultiLLMVotingSystemV2':
+        """获取前n个agent的子集"""
+        subset_configs = [(agent.llm_name, agent.weight) for agent in self.agents[:num_agents]]
+        return MultiLLMVotingSystemV2(subset_configs)
 
-    async def vote_on_question(self, question: str, debug: bool = False) -> Tuple[str, Dict]:
+    async def vote_on_question(
+            self,
+            question_id: int,
+            question: str,
+            correct_answer: str,
+            active_agent_ids: Optional[List[str]] = None
+    ) -> QuestionRecord:
         """
         对单个问题进行投票
 
         Args:
+            question_id: 问题ID
             question: 问题文本
-            debug: 是否输出调试信息
-
-        Returns:
-            (final_answer, voting_details)
+            correct_answer: 正确答案
+            active_agent_ids: 参与投票的agent ID列表，None表示全部参与
         """
-        # 并发收集所有智能体的投票
-        tasks = [agent.vote(question) for agent in self.agents]
-        responses = await asyncio.gather(*tasks, return_exceptions=True)
+        record = QuestionRecord(
+            question_id=question_id,
+            question_text=question[:500],  # 截断保存
+            correct_answer=correct_answer
+        )
 
-        # 处理异常和提取答案
-        votes = []
-        debug_info = []
+        start_time = time.time()
 
-        for agent, response in zip(self.agents, responses):
-            if isinstance(response, Exception):
-                print(f"  ⚠️  {agent.agent_id} failed: {response}")
-                votes.append(("ERROR", agent.weight))
-                debug_info.append({
-                    'agent': agent.agent_id,
-                    'status': 'error',
-                    'error': str(response)
-                })
+        # 确定参与的agents
+        active_agents = self.agents
+        if active_agent_ids:
+            active_agents = [a for a in self.agents if a.agent_id in active_agent_ids]
+
+        # 并发收集投票
+        tasks = [agent.vote(question) for agent in active_agents]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # 处理结果
+        vote_scores = defaultdict(float)
+        vote_counts = defaultdict(int)
+
+        for agent, result in zip(active_agents, results):
+            if isinstance(result, Exception):
+                vote = AgentVote(
+                    agent_id=agent.agent_id,
+                    llm_name=agent.llm_name,
+                    weight=agent.weight,
+                    raw_response=f"ERROR: {str(result)}",
+                    extracted_answer="ERROR",
+                    response_time=0.0,
+                    is_correct=False
+                )
             else:
-                # 提取答案
-                answer = self._extract_answer(response)
-                votes.append((answer, agent.weight))
+                response, resp_time = result
+                extracted = self._extract_answer(response)
+                vote = AgentVote(
+                    agent_id=agent.agent_id,
+                    llm_name=agent.llm_name,
+                    weight=agent.weight,
+                    raw_response=response,
+                    extracted_answer=extracted,
+                    response_time=resp_time,
+                    is_correct=(extracted == correct_answer)
+                )
 
-                # 收集调试信息
-                if debug:
-                    debug_info.append({
-                        'agent': agent.agent_id,
-                        'raw_response': response[:300] + '...' if len(response) > 300 else response,
-                        'extracted_answer': answer,
-                        'weight': agent.weight
-                    })
+                if extracted not in ["INVALID", "ERROR"]:
+                    vote_scores[extracted] += agent.weight
+                    vote_counts[extracted] += 1
 
-        # 如果启用调试，打印提取过程
-        if debug and debug_info:
-            print("\n" + "=" * 60)
-            print("DEBUG: Answer Extraction Process")
-            print("=" * 60)
-            for info in debug_info:
-                if info.get('status') != 'error':
-                    print(f"\n{info['agent']}:")
-                    print(f"  Raw Response: {info['raw_response']}")
-                    print(f"  Extracted: {info['extracted_answer']}")
-                    print(f"  Weight: {info['weight']}")
-            print("=" * 60 + "\n")
+            record.agent_votes.append(vote)
 
-        # 加权投票
-        final_answer, voting_details = self._weighted_vote(votes)
+        # 计算最终答案和统计
+        record.vote_distribution = dict(vote_scores)
+        record.raw_vote_counts = dict(vote_counts)
 
-        if debug_info:
-            voting_details['debug_info'] = debug_info
+        if vote_scores:
+            record.final_answer = max(vote_scores.items(), key=lambda x: x[1])[0]
+        else:
+            record.final_answer = "INVALID"
 
-        return final_answer, voting_details
+        record.is_correct = (record.final_answer == correct_answer)
+
+        # 一致性指标
+        total_valid_votes = sum(vote_counts.values())
+        if total_valid_votes > 0:
+            max_votes = max(vote_counts.values())
+            record.is_unanimous = (len(vote_counts) == 1)
+            record.agreement_ratio = max_votes / total_valid_votes
+
+            # 计算熵
+            probs = [c / total_valid_votes for c in vote_counts.values()]
+            record.entropy = -sum(p * math.log2(p) if p > 0 else 0 for p in probs)
+
+        record.total_time = time.time() - start_time
+
+        return record
 
     def _extract_answer(self, response: str) -> str:
-        """
-        从回复中提取答案字母（鲁棒版本）
+        """从回复中提取答案字母"""
 
-        策略优先级：
-        1. **Answer: X** 格式（最可靠）
-        2. 最后一个出现的独立字母（A/B/C/D）
-        3. <think>标签后的第一个字母
-        4. 整个文本中第一个出现的字母
-        """
-        import re
-
-        # 策略1：查找 **Answer: X** 格式（最优先）
-        answer_pattern = r'\*\*Answer:\s*([A-D])\*\*'
-        match = re.search(answer_pattern, response, re.IGNORECASE)
+        # 策略1: **Answer: X** 格式
+        match = re.search(r'\*\*Answer:\s*([A-D])\*\*', response, re.IGNORECASE)
         if match:
             return match.group(1).upper()
 
-        # 策略2：查找 Answer: X 格式（无星号）
-        answer_pattern_simple = r'(?:Answer|答案):\s*([A-D])'
-        match = re.search(answer_pattern_simple, response, re.IGNORECASE)
+        # 策略2: Answer: X 格式
+        match = re.search(r'(?:Answer|答案):\s*([A-D])', response, re.IGNORECASE)
         if match:
             return match.group(1).upper()
 
-        # 策略3：提取 </think> 标签之后的内容
+        # 策略3: </think>后的内容
         think_split = response.split('</think>')
         if len(think_split) > 1:
-            after_think = think_split[-1]  # 取最后一个 </think> 之后的内容
-
-            # 在 </think> 后查找独立的字母
-            # 匹配模式：行首、空格、标点后的单独字母
-            letter_pattern = r'(?:^|\s|[.!?\n])\s*([A-D])(?:\s|[.!?,\n]|$)'
-            match = re.search(letter_pattern, after_think, re.MULTILINE | re.IGNORECASE)
+            after_think = think_split[-1]
+            match = re.search(r'(?:^|\s|[.!?\n])\s*([A-D])(?:\s|[.!?,\n]|$)', after_think, re.MULTILINE | re.IGNORECASE)
             if match:
                 return match.group(1).upper()
-
-            # 如果没找到独立字母，找第一个字母
             for char in after_think:
                 if char.upper() in ['A', 'B', 'C', 'D']:
                     return char.upper()
 
-        # 策略4：查找最后一个出现的独立字母（可能是总结时的答案）
+        # 策略4: 最后一行的独立字母
         lines = response.strip().split('\n')
         for line in reversed(lines):
             line = line.strip()
-            # 检查是否是单独的字母行
             if len(line) == 1 and line.upper() in ['A', 'B', 'C', 'D']:
                 return line.upper()
-            # 检查是否包含 "选X" 或 "choose X" 等模式
-            choice_pattern = r'(?:选择?|choose|select|pick)\s*([A-D])'
-            match = re.search(choice_pattern, line, re.IGNORECASE)
-            if match:
-                return match.group(1).upper()
 
-        # 策略5：查找 "X is correct" 或 "X 是正确的" 模式
-        correct_pattern = r'([A-D])\s*(?:is|为|是)\s*(?:correct|right|正确)'
-        matches = re.findall(correct_pattern, response, re.IGNORECASE)
+        # 策略5: "X is correct" 模式
+        matches = re.findall(r'([A-D])\s*(?:is|为|是)\s*(?:correct|right|正确)', response, re.IGNORECASE)
         if matches:
-            return matches[-1].upper()  # 取最后一个匹配
+            return matches[-1].upper()
 
-        # 策略6：查找所有独立出现的字母，取最后一个
-        all_letters = re.findall(r'(?:^|\s|[.!?\n])\s*([A-D])(?:\s|[.!?,\n]|$)', response,
-                                 re.MULTILINE | re.IGNORECASE)
+        # 策略6: 所有独立字母中的最后一个
+        all_letters = re.findall(r'(?:^|\s|[.!?\n])\s*([A-D])(?:\s|[.!?,\n]|$)', response, re.MULTILINE | re.IGNORECASE)
         if all_letters:
             return all_letters[-1].upper()
 
-        # 策略7：在整个文本中查找第一个字母（最后的兜底）
+        # 策略7: 文本中第一个字母
         for char in response:
             if char.upper() in ['A', 'B', 'C', 'D']:
                 return char.upper()
 
-        # 如果所有策略都失败，返回INVALID
         return "INVALID"
 
-    def _weighted_vote(self, votes: List[Tuple[str, float]]) -> Tuple[str, Dict]:
+
+# ============================================================================
+# 实验运行器
+# ============================================================================
+
+class ExperimentRunner:
+    """实验运行器"""
+
+    def __init__(
+            self,
+            llm_configs: List[Tuple[str, float]],
+            dataset,
+            is_homogeneous: bool = True,
+            scan_mode: bool = False,
+            wandb_run=None,
+            temperature=0.7
+    ):
+        self.llm_configs = llm_configs
+        self.dataset = dataset
+        self.is_homogeneous = is_homogeneous
+        self.scan_mode = scan_mode
+        self.wandb_run = wandb_run
+
+        # 初始化投票系统
+        self.voting_system = MultiLLMVotingSystemV2(llm_configs, temperature=temperature)
+
+        # 实验元数据
+        self.experiment_id = time.strftime("%Y%m%d_%H%M%S")
+        self.metadata = ExperimentMetadata(
+            experiment_id=self.experiment_id,
+            timestamp=time.strftime("%Y-%m-%d %H:%M:%S"),
+            config={},
+            llm_configs=llm_configs,
+            is_homogeneous=is_homogeneous,
+            dataset_name="MMLU",
+            dataset_split=dataset.split,
+            total_questions=0
+        )
+
+    async def run(
+            self,
+            limit_questions: Optional[int] = None,
+            batch_size: int = 4,
+            debug_first_n: int = 0
+    ) -> ExperimentMetadata:
         """
-        加权投票机制
+        运行实验
 
         Args:
-            votes: List of (answer, weight)
-
-        Returns:
-            (final_answer, details)
+            limit_questions: 限制问题数量
+            batch_size: 批处理大小
+            debug_first_n: 前N个问题启用调试
         """
-        # 统计每个答案的加权得分
-        scores = {}
-        for answer, weight in votes:
-            if answer not in scores:
-                scores[answer] = 0.0
-            scores[answer] += weight
+        total_questions = min(len(self.dataset), limit_questions) if limit_questions else len(self.dataset)
+        self.metadata.total_questions = total_questions
 
-        # 找出得分最高的答案
-        if not scores:
-            final_answer = "INVALID"
-        else:
-            final_answer = max(scores.items(), key=lambda x: x[1])[0]
+        print(f"\n{'=' * 80}")
+        print(f"RUNNING EXPERIMENT: {self.experiment_id}")
+        print(f"{'=' * 80}")
+        print(f"Total Agents: {len(self.voting_system.agents)}")
+        print(f"Total Questions: {total_questions}")
+        print(f"Scan Mode: {self.scan_mode}")
+        print(f"{'=' * 80}\n")
 
-        # 构建详细信息
-        details = {
-            'votes': votes,
-            'scores': scores,
-            'final_answer': final_answer
-        }
+        # 重置计数器
+        Cost.instance().reset()
+        PromptTokens.instance().reset()
+        CompletionTokens.instance().reset()
 
-        return final_answer, details
+        start_time = time.time()
 
+        # 收集所有问题的记录
+        question_records = []
+        num_batches = math.ceil(total_questions / batch_size)
 
-class VotingMetrics:
-    """投票系统性能指标"""
+        for batch_idx in tqdm(range(num_batches), desc="Processing"):
+            start_idx = batch_idx * batch_size
+            end_idx = min(start_idx + batch_size, total_questions)
 
-    def __init__(self, agents: List['WeightedVotingAgent']):
-        self.correct = 0
-        self.total = 0
-        self.total_time = 0.0
+            batch_tasks = []
+            for idx in range(start_idx, end_idx):
+                record = self.dataset[idx]
+                input_dict = self.dataset.record_to_input(record)
+                question = input_dict['task']
+                correct_answer = self.dataset.record_to_target_answer(record)
 
-        # 记录agent信息
-        self.agents_info = {
-            agent.agent_id: {
-                'llm_name': agent.llm_name,
-                'weight': agent.weight,
-                'correct': 0,
-                'total': 0,
-                'answers': []  # 记录每次的答案
-            }
-            for agent in agents
-        }
+                task = self.voting_system.vote_on_question(
+                    question_id=idx,
+                    question=question,
+                    correct_answer=correct_answer
+                )
+                batch_tasks.append(task)
 
-        # 投票统计
-        self.unanimous_votes = 0  # 一致投票
-        self.split_votes = 0  # 分歧投票
+            batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
 
-        # 详细记录
-        self.results = []
+            for result in batch_results:
+                if isinstance(result, Exception):
+                    print(f"Error: {result}")
+                else:
+                    question_records.append(result)
 
-    def update(self,
-               predicted: str,
-               target: str,
-               voting_details: Dict,
-               question: str,
-               execution_time: float):
-        """更新指标"""
-        is_correct = (predicted == target)
-        self.correct += int(is_correct)
-        self.total += 1
-        self.total_time += execution_time
+                    # WandB实时记录
+                    if self.wandb_run:
+                        self.wandb_run.log({
+                            "question/is_correct": int(result.is_correct),
+                            "question/agreement_ratio": result.agreement_ratio,
+                            "question/entropy": result.entropy,
+                            "question/is_unanimous": int(result.is_unanimous),
+                            "question/time": result.total_time
+                        })
 
-        # 记录每个智能体的表现（所有agent都要记录）
-        votes_list = voting_details['votes']  # [(answer, weight), ...]
+            # 打印进度
+            if (batch_idx + 1) % 5 == 0:
+                correct = sum(1 for r in question_records if r.is_correct)
+                print(f"\nProgress: {len(question_records)}/{total_questions}, "
+                      f"Accuracy: {correct / len(question_records):.2%}")
 
-        # 遍历所有agent（按顺序）
-        for agent_id, agent_info in self.agents_info.items():
-            # 从votes_list中找到对应agent的答案
-            # agent_id格式: agent_0_xxx, agent_1_xxx, ...
-            agent_idx = int(agent_id.split('_')[1])
+        self.metadata.question_records = question_records
+        self.metadata.total_time = time.time() - start_time
+        self.metadata.total_cost = Cost.instance().value
+        self.metadata.total_prompt_tokens = int(PromptTokens.instance().value)
+        self.metadata.total_completion_tokens = int(CompletionTokens.instance().value)
 
-            if agent_idx < len(votes_list):
-                answer, weight = votes_list[agent_idx]
+        # 扫描模式：计算不同agent数量的结果
+        if self.scan_mode:
+            self._compute_scan_results()
 
-                # 更新该agent的统计
-                agent_info['total'] += 1
-                if answer == target:
-                    agent_info['correct'] += 1
+        # 打印汇总
+        self._print_summary()
 
-                # 记录该agent的答案
-                agent_info['answers'].append({
-                    'question_id': self.total,
-                    'answer': answer,
-                    'target': target,
-                    'correct': (answer == target)
-                })
+        # WandB记录汇总
+        if self.wandb_run:
+            self._log_to_wandb()
 
-        # 投票一致性分析
-        answers = [vote[0] for vote in votes_list]
-        if len(set(answers)) == 1:
-            self.unanimous_votes += 1
-        else:
-            self.split_votes += 1
+        return self.metadata
 
-        # 详细记录
-        self.results.append({
-            'question': question[:100] + '...',
-            'predicted': predicted,
-            'target': target,
-            'correct': is_correct,
-            'votes': votes_list,
-            'scores': voting_details['scores'],
-            'time': execution_time,
-            'agent_answers': {
-                f"agent_{idx}": votes_list[idx][0]
-                for idx in range(len(votes_list))
-            }
-        })
-
-    def get_accuracy(self) -> float:
-        return self.correct / self.total if self.total > 0 else 0.0
-
-    def get_agent_accuracy(self, agent_id: str) -> float:
-        agent_info = self.agents_info.get(agent_id)
-        if agent_info is None or agent_info['total'] == 0:
-            return 0.0
-        return agent_info['correct'] / agent_info['total']
-
-    def print_summary(self):
+    def _compute_scan_results(self):
+        """计算扫描模式的结果"""
         print("\n" + "=" * 80)
-        print("VOTING SYSTEM PERFORMANCE SUMMARY")
+        print("COMPUTING SCAN RESULTS")
         print("=" * 80)
 
+        num_agents = len(self.voting_system.agents)
+
+        for n in range(1, num_agents + 1):
+            # 获取前n个agent的ID
+            agent_ids = [agent.agent_id for agent in self.voting_system.agents[:n]]
+
+            # 重新计算每道题的结果
+            correct_count = 0
+            unanimous_count = 0
+            total_agreement = 0.0
+            total_time = 0.0
+
+            for record in self.metadata.question_records:
+                # 筛选前n个agent的投票
+                subset_votes = [v for v in record.agent_votes if v.agent_id in agent_ids]
+
+                # 重新计算加权得分
+                vote_scores = defaultdict(float)
+                vote_counts = defaultdict(int)
+                total_weight = sum(v.weight for v in subset_votes)
+
+                for vote in subset_votes:
+                    if vote.extracted_answer not in ["INVALID", "ERROR"]:
+                        normalized_weight = vote.weight / total_weight if total_weight > 0 else 0
+                        vote_scores[vote.extracted_answer] += normalized_weight
+                        vote_counts[vote.extracted_answer] += 1
+
+                # 最终答案
+                if vote_scores:
+                    final_answer = max(vote_scores.items(), key=lambda x: x[1])[0]
+                    is_correct = (final_answer == record.correct_answer)
+                else:
+                    is_correct = False
+
+                correct_count += int(is_correct)
+
+                # 一致性
+                total_valid = sum(vote_counts.values())
+                if total_valid > 0:
+                    unanimous_count += int(len(vote_counts) == 1)
+                    total_agreement += max(vote_counts.values()) / total_valid
+
+                total_time += record.total_time
+
+            total_questions = len(self.metadata.question_records)
+
+            scan_result = ScanResult(
+                num_agents=n,
+                agent_ids=agent_ids,
+                accuracy=correct_count / total_questions if total_questions > 0 else 0,
+                correct_count=correct_count,
+                total_count=total_questions,
+                unanimous_ratio=unanimous_count / total_questions if total_questions > 0 else 0,
+                avg_agreement_ratio=total_agreement / total_questions if total_questions > 0 else 0,
+                avg_time=total_time / total_questions if total_questions > 0 else 0
+            )
+
+            self.metadata.scan_results.append(scan_result)
+
+            print(f"  Agents={n}: Accuracy={scan_result.accuracy:.2%} "
+                  f"({correct_count}/{total_questions}), "
+                  f"Unanimous={scan_result.unanimous_ratio:.1%}")
+
+    def _print_summary(self):
+        """打印实验汇总"""
+        print("\n" + "=" * 80)
+        print("EXPERIMENT SUMMARY")
+        print("=" * 80)
+
+        records = self.metadata.question_records
+        correct = sum(1 for r in records if r.is_correct)
+        unanimous = sum(1 for r in records if r.is_unanimous)
+
         print(f"\n📊 Overall Performance:")
-        print(f"  Accuracy: {self.get_accuracy():.2%} ({self.correct}/{self.total})")
-        print(f"  Avg Time: {self.total_time / self.total:.2f}s per question")
+        print(f"  Accuracy: {correct / len(records):.2%} ({correct}/{len(records)})")
+        print(f"  Unanimous Votes: {unanimous / len(records):.1%}")
+        print(f"  Avg Agreement: {sum(r.agreement_ratio for r in records) / len(records):.2%}")
+        print(f"  Avg Entropy: {sum(r.entropy for r in records) / len(records):.3f}")
 
-        print(f"\n🤖 Individual Agent Performance:")
-        for agent_id in sorted(self.agents_info.keys()):
-            agent_info = self.agents_info[agent_id]
-            acc = self.get_agent_accuracy(agent_id)
-            correct = agent_info['correct']
-            total = agent_info['total']
-            llm_name = agent_info['llm_name'].split('/')[-1]  # 只显示模型名
-            weight = agent_info['weight']
+        print(f"\n🤖 Per-Agent Performance:")
+        agent_stats = defaultdict(lambda: {'correct': 0, 'total': 0})
+        for record in records:
+            for vote in record.agent_votes:
+                agent_stats[vote.agent_id]['total'] += 1
+                if vote.is_correct:
+                    agent_stats[vote.agent_id]['correct'] += 1
 
-            print(f"  {agent_id} ({llm_name}, weight={weight:.2f}):")
-            print(f"    Accuracy: {acc:.2%} ({correct}/{total})")
+        for agent_id in sorted(agent_stats.keys()):
+            stats = agent_stats[agent_id]
+            acc = stats['correct'] / stats['total'] if stats['total'] > 0 else 0
+            print(f"  {agent_id}: {acc:.2%} ({stats['correct']}/{stats['total']})")
 
-        print(f"\n🗳️  Voting Statistics:")
-        print(f"  Unanimous Votes: {self.unanimous_votes} ({self.unanimous_votes / self.total:.1%})")
-        print(f"  Split Votes: {self.split_votes} ({self.split_votes / self.total:.1%})")
+        print(f"\n💰 Cost:")
+        print(f"  Total Cost: ${self.metadata.total_cost:.4f}")
+        print(f"  Prompt Tokens: {self.metadata.total_prompt_tokens / 1000:.1f}k")
+        print(f"  Completion Tokens: {self.metadata.total_completion_tokens / 1000:.1f}k")
+        print(f"  Total Time: {self.metadata.total_time:.1f}s")
 
-        print(f"\n💰 Cost Estimate:")
-        print(f"  Total Cost: ${Cost.instance().value:.4f}")
-        print(f"  Prompt Tokens: {PromptTokens.instance().value / 1000:.1f}k")
-        print(f"  Completion Tokens: {CompletionTokens.instance().value / 1000:.1f}k")
+        if self.metadata.scan_results:
+            print(f"\n📈 Scan Results (Accuracy by # of Agents):")
+            for sr in self.metadata.scan_results:
+                bar = "█" * int(sr.accuracy * 20)
+                print(f"  {sr.num_agents:2d} agents: {bar:<20} {sr.accuracy:.2%}")
 
         print("\n" + "=" * 80)
 
-    def save_results(self, output_path: Path):
-        """保存详细结果"""
+    def _log_to_wandb(self):
+        """记录到WandB"""
+        records = self.metadata.question_records
+        correct = sum(1 for r in records if r.is_correct)
 
-        # 构建agent性能字典
-        agent_performance = {}
-        for agent_id, agent_info in self.agents_info.items():
-            agent_performance[agent_id] = {
-                'llm_name': agent_info['llm_name'],
-                'weight': agent_info['weight'],
-                'accuracy': self.get_agent_accuracy(agent_id),
-                'correct': agent_info['correct'],
-                'total': agent_info['total']
-            }
-
-        results_dict = {
-            'summary': {
-                'accuracy': self.get_accuracy(),
-                'correct': self.correct,
-                'total': self.total,
-                'avg_time': self.total_time / self.total if self.total > 0 else 0,
-                'unanimous_votes': self.unanimous_votes,
-                'split_votes': self.split_votes,
-                'total_cost': Cost.instance().value
-            },
-            'agent_performance': agent_performance,
-            'results': self.results
-        }
-
-        with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(results_dict, f, indent=2, ensure_ascii=False)
-
-        print(f"\n✓ Results saved to: {output_path}")
-
-
-async def run_voting_experiment(
-        num_agents: int,
-        weights: List[float] = None,
-        limit_questions: int = None,
-        batch_size: int = 4,
-        save_results: bool = True,
-        debug_first_n: int = 3,  # 前N个问题启用调试
-        **kwargs
-):
-    """
-    运行多LLM投票实验
-
-    Args:
-        num_agents: 智能体数量（3或6）
-        weights: 自定义权重列表
-        limit_questions: 限制问题数量
-        batch_size: 批处理大小
-        save_results: 是否保存结果
-        debug_first_n: 前N个问题启用调试模式
-    """
-
-    # 配置LLM和权重
-    llm_configs = get_llm_configs(num_agents, weights)
-
-    # 初始化投票系统
-    voting_system = MultiLLMVotingSystem(llm_configs, domain="mmlu")
-
-    # 加载数据集
-    print("Loading MMLU validation dataset...")
-    download()
-    dataset = MMLUDataset('val')
-
-    total_questions = min(len(dataset), limit_questions) if limit_questions else len(dataset)
-    print(f"Testing on {total_questions} questions")
-    if debug_first_n > 0:
-        print(f"Debug mode enabled for first {debug_first_n} questions\n")
-    else:
-        print()
-
-    # 初始化指标
-    metrics = VotingMetrics(voting_system.agents)  # 传入agents列表
-
-    # 重置计数器
-    Cost.instance().reset()
-    PromptTokens.instance().reset()
-    CompletionTokens.instance().reset()
-
-    # 批处理执行
-    num_batches = math.ceil(total_questions / batch_size)
-
-    for batch_idx in tqdm(range(num_batches), desc="Processing batches"):
-        start_idx = batch_idx * batch_size
-        end_idx = min(start_idx + batch_size, total_questions)
-
-        batch_tasks = []
-        batch_records = []
-
-        for idx in range(start_idx, end_idx):
-            record = dataset[idx]
-            input_dict = dataset.record_to_input(record)
-            question = input_dict['task']
-
-            # 前N个问题启用调试
-            enable_debug = (idx < debug_first_n)
-
-            batch_tasks.append(voting_system.vote_on_question(question, debug=enable_debug))
-            batch_records.append(record)
-
-        # 并发执行批次
-        batch_start = time.time()
-        batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
-        batch_time = time.time() - batch_start
-
-        # 处理结果
-        for record, result in zip(batch_records, batch_results):
-            if isinstance(result, Exception):
-                print(f"\n❌ Error: {result}")
-                continue
-
-            final_answer, voting_details = result
-            target = dataset.record_to_target_answer(record)
-            question = dataset.record_to_input(record)['task']
-
-            # 更新指标
-            metrics.update(
-                predicted=final_answer,
-                target=target,
-                voting_details=voting_details,
-                question=question,
-                execution_time=batch_time / len(batch_records)
-            )
-
-        # 每5个批次打印进度
-        if (batch_idx + 1) % 5 == 0:
-            print(f"\n--- Progress: {end_idx}/{total_questions} ---")
-            print(f"  Current Accuracy: {metrics.get_accuracy():.2%}")
-            print(f"  Avg Time: {metrics.total_time / metrics.total:.2f}s")
-
-    # 打印最终结果
-    metrics.print_summary()
-
-    # 保存结果
-    if save_results:
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        result_dir = GDesigner_ROOT / "result" / "multi_llm_voting"
-        result_dir.mkdir(parents=True, exist_ok=True)
-
-        output_file = result_dir / f"voting_{num_agents}agents_{timestamp}.json"
-        metrics.save_results(output_file)
-
-    # WandB记录
-    if "wandb_run" in kwargs:
-        kwargs["wandb_run"].log({
-            "accuracy": metrics.get_accuracy(),
-            "unanimous_votes_ratio": metrics.unanimous_votes / metrics.total,
-            "avg_time": metrics.total_time / metrics.total,
-            "total_cost": Cost.instance().value
+        self.wandb_run.log({
+            "summary/accuracy": correct / len(records),
+            "summary/unanimous_ratio": sum(1 for r in records if r.is_unanimous) / len(records),
+            "summary/avg_agreement": sum(r.agreement_ratio for r in records) / len(records),
+            "summary/avg_entropy": sum(r.entropy for r in records) / len(records),
+            "summary/total_cost": self.metadata.total_cost,
+            "summary/total_time": self.metadata.total_time
         })
 
-        # 记录每个agent的准确率
-        for agent_id in metrics.agents_info.keys():
-            kwargs["wandb_run"].log({
-                f"agent_accuracy/{agent_id}": metrics.get_agent_accuracy(agent_id)
-            })
+        # 每个agent的准确率
+        agent_stats = defaultdict(lambda: {'correct': 0, 'total': 0})
+        for record in records:
+            for vote in record.agent_votes:
+                agent_stats[vote.agent_id]['total'] += 1
+                if vote.is_correct:
+                    agent_stats[vote.agent_id]['correct'] += 1
 
-    return metrics
+        for agent_id, stats in agent_stats.items():
+            acc = stats['correct'] / stats['total'] if stats['total'] > 0 else 0
+            self.wandb_run.log({f"agent/{agent_id}_accuracy": acc})
+
+        # 扫描结果
+        if self.metadata.scan_results:
+            # 创建表格数据
+            scan_data = [[sr.num_agents, sr.accuracy, sr.unanimous_ratio]
+                         for sr in self.metadata.scan_results]
+
+            import wandb
+            table = wandb.Table(
+                data=scan_data,
+                columns=["num_agents", "accuracy", "unanimous_ratio"]
+            )
+            self.wandb_run.log({"scan_results": table})
+
+            # 创建折线图
+            for sr in self.metadata.scan_results:
+                self.wandb_run.log({
+                    "scan/accuracy": sr.accuracy,
+                    "scan/num_agents": sr.num_agents
+                })
+
+    def save_results(self, output_dir: Path):
+        """保存实验结果"""
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1. 保存JSON汇总
+        json_path = output_dir / f"experiment_{self.experiment_id}.json"
+        json_data = {
+            "experiment_id": self.metadata.experiment_id,
+            "timestamp": self.metadata.timestamp,
+            "config": self.metadata.config,
+            "is_homogeneous": self.metadata.is_homogeneous,
+            "llm_configs": self.metadata.llm_configs,
+            "total_questions": self.metadata.total_questions,
+            "total_cost": self.metadata.total_cost,
+            "total_time": self.metadata.total_time,
+            "summary": {
+                "accuracy": sum(1 for r in self.metadata.question_records if r.is_correct) / len(
+                    self.metadata.question_records),
+                "unanimous_ratio": sum(1 for r in self.metadata.question_records if r.is_unanimous) / len(
+                    self.metadata.question_records),
+            },
+            "scan_results": [asdict(sr) for sr in self.metadata.scan_results] if self.metadata.scan_results else None
+        }
+
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(json_data, f, indent=2, ensure_ascii=False)
+        print(f"✓ JSON summary saved to: {json_path}")
+
+        # 2. 保存完整元数据（pickle）
+        pickle_path = output_dir / f"metadata_{self.experiment_id}.pkl"
+        with open(pickle_path, 'wb') as f:
+            pickle.dump(self.metadata, f)
+        print(f"✓ Full metadata saved to: {pickle_path}")
+
+        return json_path, pickle_path
 
 
-def get_llm_configs(num_agents: int, weights: List[float] = None) -> List[Tuple[str, float]]:
-    """
-    获取LLM配置和权重
+# ============================================================================
+# 配置工具函数
+# ============================================================================
 
-    Args:
-        num_agents: 智能体数量（3或6）
-        weights: 自定义权重列表
-
-    Returns:
-        List of (llm_name, weight)
-    """
-    # 可用的LLM模型（按规模从小到大）
-    available_models = [
-        "Qwen/Qwen3-0.6B",
-        "Qwen/Qwen3-1.7B",
-        "Qwen/Qwen3-4B",
-    ]
-
-    # 根据智能体数量选择模型
-    if num_agents == 3:
-        selected_models = available_models
-    elif num_agents == 6:
-        # 每种模型各用两次
-        selected_models = [model for model in available_models for _ in range(2)]
-    else:
-        raise ValueError(f"Unsupported num_agents: {num_agents}. Only 3 or 6 are supported.")
-
-    # 设置权重
+def create_homogeneous_config(llm_name: str, num_agents: int, weights: Optional[List[float]] = None) -> List[
+    Tuple[str, float]]:
+    """创建同构LLM配置"""
     if weights is None:
-        # 默认权重：按模型规模递增
-        if num_agents == 3:
-            weights = [882.52, 2056.91, 3033.06]  # 小模型权重低，大模型权重高
-        elif num_agents == 6:
-            weights = [882.52, 882.52, 2056.91, 2056.91, 3033.06, 3033.06]
-    else:
-        if len(weights) != num_agents:
-            raise ValueError(f"Length of weights ({len(weights)}) must equal num_agents ({num_agents})")
+        weights = [1.0] * num_agents
 
-    # 标准化权重
-    total_weight = sum(weights)
-    weights = [w / total_weight for w in weights]
+    if len(weights) != num_agents:
+        raise ValueError(f"Weights length ({len(weights)}) must match num_agents ({num_agents})")
 
-    return list(zip(selected_models, weights))
+    total = sum(weights)
+    normalized_weights = [w / total for w in weights]
 
+    return [(llm_name, w) for w in normalized_weights]
+
+
+def create_heterogeneous_config(llm_names: List[str], weights: Optional[List[float]] = None) -> List[Tuple[str, float]]:
+    """创建异构LLM配置"""
+    num_agents = len(llm_names)
+
+    if weights is None:
+        weights = [1.0] * num_agents
+
+    if len(weights) != num_agents:
+        raise ValueError(f"Weights length ({len(weights)}) must match number of LLMs ({num_agents})")
+
+    total = sum(weights)
+    normalized_weights = [w / total for w in weights]
+
+    return list(zip(llm_names, normalized_weights))
+
+
+# ============================================================================
+# 命令行接口
+# ============================================================================
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Multi-LLM Weighted Voting System for MMLU",
+        description="Multi-LLM Weighted Voting System V2",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # 3个智能体，默认权重
-  python experiments/run_multi_llm_voting.py --num_agents 3 --limit 100
-
-  # 6个智能体，自定义权重
-  python experiments/run_multi_llm_voting.py --num_agents 6 --weights 0.1 0.15 0.2 0.1 0.15 0.3
-
-  # 完整验证集，无限制
-  python experiments/run_multi_llm_voting.py --num_agents 3
+  # 同构LLM (5个相同模型)
+  python run_multi_llm_voting_v2.py --homogeneous --llm_name "Qwen/Qwen3-4B" --num_agents 5
+  
+  # 同构LLM + 扫描模式
+  python run_multi_llm_voting_v2.py --homogeneous --llm_name "Qwen/Qwen3-4B" --num_agents 10 --scan_mode
+  
+  # 异构LLM
+  python run_multi_llm_voting_v2.py --heterogeneous --llm_names "Qwen/Qwen3-0.6B" "Qwen/Qwen3-1.7B" "Qwen/Qwen3-4B"
+  
+  # 异构LLM + 自定义权重
+  python run_multi_llm_voting_v2.py --heterogeneous --llm_names "Qwen/Qwen3-0.6B" "Qwen/Qwen3-4B" --weights 0.3 0.7
         """
     )
 
-    parser.add_argument(
-        '--num_agents',
-        type=int,
-        default=3,
-        choices=[3, 6],
-        help='Number of agents (3 or 6)'
-    )
+    # 配置模式
+    mode_group = parser.add_mutually_exclusive_group(required=True)
+    mode_group.add_argument('--homogeneous', action='store_true', help='同构LLM模式')
+    mode_group.add_argument('--heterogeneous', action='store_true', help='异构LLM模式')
 
-    parser.add_argument(
-        '--weights',
-        nargs='+',
-        type=float,
-        default=None,
-        help='Custom weights for each agent (must sum close to 1.0)'
-    )
+    # 同构模式参数
+    parser.add_argument('--llm_name', type=str, help='同构模式下的LLM名称')
+    parser.add_argument('--num_agents', type=int, default=3, help='智能体数量')
+    parser.add_argument("--temperature", default=0.7, type=int)
 
-    parser.add_argument(
-        '--limit',
-        type=int,
-        default=153,
-        help='Limit number of questions'
-    )
+    # 异构模式参数
+    parser.add_argument('--llm_names', nargs='+', type=str, help='异构模式下的LLM名称列表')
 
-    parser.add_argument(
-        '--batch_size',
-        type=int,
-        default=16,
-        help='Batch size for parallel processing'
-    )
+    # 权重
+    parser.add_argument('--weights', nargs='+', type=float, default=None, help='自定义权重')
 
-    parser.add_argument(
-        '--debug_first_n',
-        type=int,
-        default=3,
-        help='Enable debug mode for first N questions (default: 3)'
-    )
+    # 扫描模式
+    parser.add_argument('--scan_mode', action='store_true', help='启用扫描模式')
 
-    parser.add_argument(
-        '--no_save',
-        action='store_true',
-        help='Do not save results'
-    )
+    # 实验参数
+    parser.add_argument('--limit', type=int, default=153, help='限制问题数量')
+    parser.add_argument('--batch_size', type=int, default=32, help='批处理大小')
+    parser.add_argument('--debug_first_n', type=int, default=0, help='前N个问题启用调试')
 
-    parser.add_argument(
-        '--weave_project',
-        type=str,
-        default='vito_chan/Multi-LLM-Voting',
-        help='Weave project name'
-    )
+    # 输出
+    parser.add_argument('--output_dir', type=str, default=None, help='输出目录')
+    parser.add_argument('--no_wandb', action='store_true', help='禁用WandB')
+    parser.add_argument('--weave_project', type=str, default='vito_chan/Multi-LLM-Voting-V2', help='Weave项目名')
 
     return parser.parse_args()
 
 
 async def main():
-    import wandb
-
     args = parse_args()
+
+    # 验证参数
+    if args.homogeneous and not args.llm_name:
+        raise ValueError("同构模式必须指定 --llm_name")
+    if args.heterogeneous and not args.llm_names:
+        raise ValueError("异构模式必须指定 --llm_names")
+
+    # 创建配置
+    if args.homogeneous:
+        llm_configs = create_homogeneous_config(args.llm_name, args.num_agents, args.weights)
+        is_homogeneous = True
+    else:
+        llm_configs = create_heterogeneous_config(args.llm_names, args.weights)
+        is_homogeneous = False
+
+    print("\n" + "=" * 80)
+    print("MULTI-LLM VOTING SYSTEM V2")
+    print("=" * 80)
+    print(f"Mode: {'Homogeneous' if is_homogeneous else 'Heterogeneous'}")
+    print(f"LLM Configs:")
+    for llm_name, weight in llm_configs:
+        print(f"  - {llm_name}: weight={weight:.3f}")
+    print(f"Scan Mode: {args.scan_mode}")
+    print("=" * 80 + "\n")
 
     # 初始化追踪
     weave.init(project_name=args.weave_project)
-    wandb_run = wandb.init(
-        project="Multi-LLM-Voting",
-        config=args,
-        name=time.strftime("%Y-%m-%d_%H-%M-%S")
-    )
 
-    print("\n" + "=" * 80)
-    print("MULTI-LLM WEIGHTED VOTING SYSTEM - MMLU EXPERIMENT")
-    print("=" * 80)
-    print(f"Date: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"Agents: {args.num_agents}")
-    print(f"Custom Weights: {args.weights if args.weights else 'Default'}")
-    print("=" * 80)
-
-    try:
-        metrics = await run_voting_experiment(
-            num_agents=args.num_agents,
-            weights=args.weights,
-            limit_questions=args.limit,
-            batch_size=args.batch_size,
-            save_results=not args.no_save,
-            debug_first_n=args.debug_first_n,
-            wandb_run=wandb_run
+    wandb_run = None
+    if not args.no_wandb:
+        import wandb
+        wandb_run = wandb.init(
+            project="Multi-LLM-Voting-V2",
+            config=vars(args),
+            name=f"{'homo' if is_homogeneous else 'hetero'}_{len(llm_configs)}agents_{time.strftime('%H%M%S')}"
         )
 
-        print("\n" + "=" * 80)
-        print("✅ EXPERIMENT COMPLETED SUCCESSFULLY")
-        print("=" * 80 + "\n")
+    # 加载数据集
+    download()
+    dataset = MMLUDataset('val')
 
-    except KeyboardInterrupt:
-        print("\n\n⚠️  Experiment interrupted by user")
-    except Exception as e:
-        print(f"\n\n❌ Experiment failed: {e}")
-        import traceback
-        traceback.print_exc()
+    # 创建实验运行器
+    runner = ExperimentRunner(
+        llm_configs=llm_configs,
+        dataset=dataset,
+        is_homogeneous=is_homogeneous,
+        scan_mode=args.scan_mode,
+        wandb_run=wandb_run,
+        temperature=args.temperature
+    )
+
+    # 运行实验
+    metadata = await runner.run(
+        limit_questions=args.limit,
+        batch_size=args.batch_size,
+        debug_first_n=args.debug_first_n
+    )
+
+    # 保存结果
+    output_dir = Path(args.output_dir) if args.output_dir else GDesigner_ROOT / "result" / "multi_llm_voting_v2"
+    runner.save_results(output_dir)
+
+    print("\n✅ EXPERIMENT COMPLETED SUCCESSFULLY\n")
+
+    if wandb_run:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":
