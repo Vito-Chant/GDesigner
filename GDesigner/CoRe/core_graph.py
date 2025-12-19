@@ -58,6 +58,9 @@ class CoReGraph:
         from GDesigner.CoRe.unified_ranker import UnifiedRanker
         from GDesigner.CoRe.belief_evolver import BeliefEvolver
 
+        from GDesigner.CoRe.generalized_belief_evolver import GeneralizedBeliefEvolver
+        from GDesigner.CoRe.mind_registry_v5 import MindRegistryV5
+
         self.domain = domain
         self.llm_name = llm_name
         self.available_roles = available_roles
@@ -67,7 +70,8 @@ class CoReGraph:
 
         # 初始化组件
         self.llm = LLMRegistry.get(llm_name)
-        self.mind_registry = MindRegistry(save_path=registry_save_path)
+        # self.mind_registry = MindRegistry(save_path=registry_save_path)
+        self.mind_registry = MindRegistryV5(save_path=registry_save_path)
         self._initialize_agent_profiles()
 
         # [并发修复] 这里只获取一个 ID 或原型，不要在执行中直接使用这个实例
@@ -87,9 +91,14 @@ class CoReGraph:
             decision_maker_id=self.decision_maker_id
         )
 
-        self.belief_evolver = BeliefEvolver(
+        # self.belief_evolver = BeliefEvolver(
+        #     llm=self.llm,
+        #     mind_registry=self.mind_registry
+        # )
+        self.belief_evolver = GeneralizedBeliefEvolver(
             llm=self.llm,
-            mind_registry=self.mind_registry
+            mind_registry=self.mind_registry,
+            domain=domain
         )
 
     def _initialize_agent_profiles(self):
@@ -135,9 +144,13 @@ class CoReGraph:
         """
         主执行循环 - Cognitive Relay (并发安全版)
         """
+        from GDesigner.CoRe.task_abstractor import TaskAbstractor
 
         start_time = time.time()
         task = input_dict['task']
+
+        abstractor = TaskAbstractor(domain=self.domain)
+        task_capabilities = list(abstractor.extract_task_types(task))
 
         # [并发修复] 使用局部变量替代 self 属性
         history_trace = []
@@ -244,7 +257,8 @@ class CoReGraph:
             context = self.mind_registry.get_context_for_routing(
                 current_agent=current_agent,
                 candidate_agents=candidate_agents,
-                task_description=task
+                task_description=task,
+                task_capabilities=task_capabilities
             )
 
             routing_decision = await self.unified_ranker.route_llm(

@@ -335,10 +335,18 @@ class VLLMChat(LLM):
         #         **api_kwargs
         #     )
 
-        import random
-        url1 = "http://localhost:8000/v1"
-        url2 = "http://localhost:8000/v1"
-        url = random.choice([url1, url2])
+        # import random
+        # url1 = "http://localhost:8000/v1"
+        # url2 = "http://localhost:8000/v1"
+        # url = random.choice([url1, url2])
+        if self.llm_name == "Qwen/Qwen3-0.6B":
+            url = "http://localhost:8000/v1"
+        elif self.llm_name == "Qwen/Qwen3-1.7B":
+            url = "http://localhost:8001/v1"
+        elif self.llm_name == "Qwen/Qwen3-4B":
+            url = "http://localhost:8002/v1"
+        else:
+            url = "http://localhost:8000/v1"
 
         # 3. 发起请求 (使用 VLLM 的地址和空 Key)
         return await _generic_achat(
