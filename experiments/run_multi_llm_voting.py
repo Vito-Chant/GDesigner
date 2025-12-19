@@ -298,14 +298,22 @@ class MultiLLMVotingSystem:
 class VotingMetrics:
     """投票系统性能指标"""
 
-    def __init__(self):
+    def __init__(self, agents: List['WeightedVotingAgent']):
         self.correct = 0
         self.total = 0
         self.total_time = 0.0
 
-        # 每个智能体的准确率
-        self.agent_correct = {}
-        self.agent_total = {}
+        # 记录agent信息
+        self.agents_info = {
+            agent.agent_id: {
+                'llm_name': agent.llm_name,
+                'weight': agent.weight,
+                'correct': 0,
+                'total': 0,
+                'answers': []  # 记录每次的答案
+            }
+            for agent in agents
+        }
 
         # 投票统计
         self.unanimous_votes = 0  # 一致投票
@@ -326,20 +334,33 @@ class VotingMetrics:
         self.total += 1
         self.total_time += execution_time
 
-        # 记录每个智能体的表现
-        for answer, weight in voting_details['votes']:
-            agent_id = f"agent_{voting_details['votes'].index((answer, weight))}"
+        # 记录每个智能体的表现（所有agent都要记录）
+        votes_list = voting_details['votes']  # [(answer, weight), ...]
 
-            if agent_id not in self.agent_correct:
-                self.agent_correct[agent_id] = 0
-                self.agent_total[agent_id] = 0
+        # 遍历所有agent（按顺序）
+        for agent_id, agent_info in self.agents_info.items():
+            # 从votes_list中找到对应agent的答案
+            # agent_id格式: agent_0_xxx, agent_1_xxx, ...
+            agent_idx = int(agent_id.split('_')[1])
 
-            self.agent_total[agent_id] += 1
-            if answer == target:
-                self.agent_correct[agent_id] += 1
+            if agent_idx < len(votes_list):
+                answer, weight = votes_list[agent_idx]
+
+                # 更新该agent的统计
+                agent_info['total'] += 1
+                if answer == target:
+                    agent_info['correct'] += 1
+
+                # 记录该agent的答案
+                agent_info['answers'].append({
+                    'question_id': self.total,
+                    'answer': answer,
+                    'target': target,
+                    'correct': (answer == target)
+                })
 
         # 投票一致性分析
-        answers = [vote[0] for vote in voting_details['votes']]
+        answers = [vote[0] for vote in votes_list]
         if len(set(answers)) == 1:
             self.unanimous_votes += 1
         else:
@@ -351,18 +372,23 @@ class VotingMetrics:
             'predicted': predicted,
             'target': target,
             'correct': is_correct,
-            'votes': voting_details['votes'],
+            'votes': votes_list,
             'scores': voting_details['scores'],
-            'time': execution_time
+            'time': execution_time,
+            'agent_answers': {
+                f"agent_{idx}": votes_list[idx][0]
+                for idx in range(len(votes_list))
+            }
         })
 
     def get_accuracy(self) -> float:
         return self.correct / self.total if self.total > 0 else 0.0
 
     def get_agent_accuracy(self, agent_id: str) -> float:
-        if agent_id not in self.agent_total or self.agent_total[agent_id] == 0:
+        agent_info = self.agents_info.get(agent_id)
+        if agent_info is None or agent_info['total'] == 0:
             return 0.0
-        return self.agent_correct[agent_id] / self.agent_total[agent_id]
+        return agent_info['correct'] / agent_info['total']
 
     def print_summary(self):
         print("\n" + "=" * 80)
@@ -374,11 +400,16 @@ class VotingMetrics:
         print(f"  Avg Time: {self.total_time / self.total:.2f}s per question")
 
         print(f"\n🤖 Individual Agent Performance:")
-        for agent_id in sorted(self.agent_correct.keys()):
+        for agent_id in sorted(self.agents_info.keys()):
+            agent_info = self.agents_info[agent_id]
             acc = self.get_agent_accuracy(agent_id)
-            correct = self.agent_correct[agent_id]
-            total = self.agent_total[agent_id]
-            print(f"  {agent_id}: {acc:.2%} ({correct}/{total})")
+            correct = agent_info['correct']
+            total = agent_info['total']
+            llm_name = agent_info['llm_name'].split('/')[-1]  # 只显示模型名
+            weight = agent_info['weight']
+
+            print(f"  {agent_id} ({llm_name}, weight={weight:.2f}):")
+            print(f"    Accuracy: {acc:.2%} ({correct}/{total})")
 
         print(f"\n🗳️  Voting Statistics:")
         print(f"  Unanimous Votes: {self.unanimous_votes} ({self.unanimous_votes / self.total:.1%})")
@@ -393,6 +424,18 @@ class VotingMetrics:
 
     def save_results(self, output_path: Path):
         """保存详细结果"""
+
+        # 构建agent性能字典
+        agent_performance = {}
+        for agent_id, agent_info in self.agents_info.items():
+            agent_performance[agent_id] = {
+                'llm_name': agent_info['llm_name'],
+                'weight': agent_info['weight'],
+                'accuracy': self.get_agent_accuracy(agent_id),
+                'correct': agent_info['correct'],
+                'total': agent_info['total']
+            }
+
         results_dict = {
             'summary': {
                 'accuracy': self.get_accuracy(),
@@ -403,14 +446,7 @@ class VotingMetrics:
                 'split_votes': self.split_votes,
                 'total_cost': Cost.instance().value
             },
-            'agent_performance': {
-                agent_id: {
-                    'accuracy': self.get_agent_accuracy(agent_id),
-                    'correct': self.agent_correct[agent_id],
-                    'total': self.agent_total[agent_id]
-                }
-                for agent_id in self.agent_correct.keys()
-            },
+            'agent_performance': agent_performance,
             'results': self.results
         }
 
@@ -460,7 +496,7 @@ async def run_voting_experiment(
         print()
 
     # 初始化指标
-    metrics = VotingMetrics()
+    metrics = VotingMetrics(voting_system.agents)  # 传入agents列表
 
     # 重置计数器
     Cost.instance().reset()
@@ -540,7 +576,7 @@ async def run_voting_experiment(
         })
 
         # 记录每个agent的准确率
-        for agent_id in metrics.agent_correct.keys():
+        for agent_id in metrics.agents_info.keys():
             kwargs["wandb_run"].log({
                 f"agent_accuracy/{agent_id}": metrics.get_agent_accuracy(agent_id)
             })
@@ -563,7 +599,7 @@ def get_llm_configs(num_agents: int, weights: List[float] = None) -> List[Tuple[
     available_models = [
         "Qwen/Qwen3-0.6B",
         "Qwen/Qwen3-1.7B",
-        "Qwen/Qwen3-4B"
+        "Qwen/Qwen3-4B",
     ]
 
     # 根据智能体数量选择模型
@@ -579,12 +615,9 @@ def get_llm_configs(num_agents: int, weights: List[float] = None) -> List[Tuple[
     if weights is None:
         # 默认权重：按模型规模递增
         if num_agents == 3:
-            # weights = [0.22, 0.3, 0.48]  # 小模型权重低，大模型权重高
-            weights = [0.5274390243902439, 0.6185567010309279, 0.7941176470588235]  # 小模型权重低，大模型权重高 1.940113372479995
+            weights = [882.52, 2056.91, 3033.06]  # 小模型权重低，大模型权重高
         elif num_agents == 6:
-            # weights = [0.11, 0.11, 0.15, 0.15, 0.24, 0.24]
-            weights = [0.5274390243902439, 0.5274390243902439, 0.6185567010309279, 0.6185567010309279,
-                       0.7941176470588235, 0.7941176470588235]
+            weights = [882.52, 882.52, 2056.91, 2056.91, 3033.06, 3033.06]
     else:
         if len(weights) != num_agents:
             raise ValueError(f"Length of weights ({len(weights)}) must equal num_agents ({num_agents})")
@@ -639,7 +672,7 @@ Examples:
     parser.add_argument(
         '--batch_size',
         type=int,
-        default=8,
+        default=16,
         help='Batch size for parallel processing'
     )
 
