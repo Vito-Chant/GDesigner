@@ -264,12 +264,16 @@ class VLLMChat(LLM):
                 raise e
         return self._tokenizer
 
+    @weave.op()
     async def acomp(self, messages: Union[List[Message], List[Dict], str], **kwargs) -> str:
         formatted_msgs = self._preprocess_messages(messages)
+        enable_thinking = kwargs.pop('enable_thinking', True)
+
         prompt_input = self.tokenizer.apply_chat_template(
             formatted_msgs,
             tokenize=False,
-            add_generation_prompt=True
+            add_generation_prompt=True,
+            enable_thinking=enable_thinking
         )
 
         req_temp = kwargs.get('temperature', self.temperature)
@@ -277,10 +281,18 @@ class VLLMChat(LLM):
 
         api_kwargs = {k: v for k, v in kwargs.items() if k not in ['temperature', 'max_tokens']}
 
-        import random
-        url1 = "http://localhost:8000/v1"
-        url2 = "http://localhost:8000/v1"
-        url = random.choice([url1, url2])
+        # import random
+        # url1 = "http://localhost:8000/v1"
+        # url2 = "http://localhost:8000/v1"
+        # url = random.choice([url1, url2])
+        if self.llm_name == "Qwen/Qwen3-0.6B":
+            url = "http://localhost:8000/v1"
+        elif self.llm_name == "Qwen/Qwen3-1.7B":
+            url = "http://localhost:8001/v1"
+        elif self.llm_name == "Qwen/Qwen3-4B":
+            url = "http://localhost:8002/v1"
+        else:
+            url = "http://localhost:8000/v1"
 
         return await _generic_acompletion(
             model=self.llm_name,

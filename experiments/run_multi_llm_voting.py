@@ -135,12 +135,13 @@ class ExperimentMetadata:
 class VotingAgent:
     """单个投票智能体"""
 
-    def __init__(self, agent_id: str, llm_name: str, weight: float = 1.0, temperature=0.7):
+    def __init__(self, agent_id: str, llm_name: str, weight: float = 1.0, temperature=0.7, enable_thinking=True):
         self.agent_id = agent_id
         self.llm_name = llm_name
         self.weight = weight
         self.llm = LLMRegistry.get(llm_name)
         self.temperature = temperature
+        self.enable_thinking = enable_thinking
 
     async def vote(self, question: str) -> Tuple[str, float]:
         """对问题进行投票，返回(原始响应, 响应时间)"""
@@ -157,9 +158,7 @@ IMPORTANT OUTPUT FORMAT:
 
 Example output format:
 <think>
-Let me analyze this question...
-Option A seems wrong because...
-Option B is correct because...
+...
 </think>
 
 **Answer: B**"""
@@ -172,7 +171,8 @@ Option B is correct because...
         ]
 
         start_time = time.time()
-        response = await self.llm.agen(messages, temperature=self.temperature)
+        # response = await self.llm.agen(messages, temperature=self.temperature)
+        response = await self.llm.acomp(messages, temperature=self.temperature, enable_thinking=self.enable_thinking)
         elapsed_time = time.time() - start_time
 
         return response, elapsed_time
@@ -181,7 +181,7 @@ Option B is correct because...
 class MultiLLMVotingSystemV2:
     """多LLM加权投票系统 V2"""
 
-    def __init__(self, llm_configs: List[Tuple[str, float]], temperature=0.7):
+    def __init__(self, llm_configs: List[Tuple[str, float]], temperature=0.7, enable_thinking=True):
         """
         Args:
             llm_configs: List of (llm_name, weight) tuples
@@ -190,7 +190,7 @@ class MultiLLMVotingSystemV2:
 
         for idx, (llm_name, weight) in enumerate(llm_configs):
             agent_id = f"agent_{idx}_{llm_name.split('/')[-1]}"
-            agent = VotingAgent(agent_id, llm_name, weight, temperature=temperature)
+            agent = VotingAgent(agent_id, llm_name, weight, temperature=temperature, enable_thinking=enable_thinking)
             self.agents.append(agent)
 
         # 归一化权重
@@ -360,7 +360,8 @@ class ExperimentRunner:
             is_homogeneous: bool = True,
             scan_mode: bool = False,
             wandb_run=None,
-            temperature=0.7
+            temperature=0.7,
+            enable_thinking=True
     ):
         self.llm_configs = llm_configs
         self.dataset = dataset
@@ -369,7 +370,8 @@ class ExperimentRunner:
         self.wandb_run = wandb_run
 
         # 初始化投票系统
-        self.voting_system = MultiLLMVotingSystemV2(llm_configs, temperature=temperature)
+        self.voting_system = MultiLLMVotingSystemV2(llm_configs, temperature=temperature,
+                                                    enable_thinking=enable_thinking)
 
         # 实验元数据
         self.experiment_id = time.strftime("%Y%m%d_%H%M%S")
@@ -743,7 +745,8 @@ Examples:
     # 同构模式参数
     parser.add_argument('--llm_name', type=str, help='同构模式下的LLM名称')
     parser.add_argument('--num_agents', type=int, default=3, help='智能体数量')
-    parser.add_argument("--temperature", default=0.7, type=int)
+    parser.add_argument("--temperature", default=0.7, type=float)
+    parser.add_argument("--disable_thinking", action='store_true')
 
     # 异构模式参数
     parser.add_argument('--llm_names', nargs='+', type=str, help='异构模式下的LLM名称列表')
@@ -769,6 +772,8 @@ Examples:
 
 async def main():
     args = parse_args()
+    # args.llm_names = ["Qwen/Qwen3-1.7B", "Qwen/Qwen3-4B"] * 50
+    # args.weights = [61.4, 76.5] * 50
 
     # 验证参数
     if args.homogeneous and not args.llm_name:
@@ -817,7 +822,8 @@ async def main():
         is_homogeneous=is_homogeneous,
         scan_mode=args.scan_mode,
         wandb_run=wandb_run,
-        temperature=args.temperature
+        temperature=args.temperature,
+        enable_thinking=not args.disable_thinking,
     )
 
     # 运行实验
